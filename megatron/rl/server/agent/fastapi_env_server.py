@@ -39,6 +39,14 @@ from .. import agent
 from ..api import EnvironmentServer, InferenceServer, RemoteEvaluationRequest, RemoteRolloutRequest
 
 
+def _safe_unwrap(interface):
+    """Unwrap inference interface, falling back to the raw object if type is unregistered."""
+    try:
+        return interface.unwrap()
+    except (KeyError, AttributeError):
+        return interface
+
+
 @EnvironmentServer.register_subclass
 class FastAPIEnvServer(EnvironmentServer):
     server_type: str = Field('FastAPIEnvServer', frozen=True, Literal=True)
@@ -56,8 +64,9 @@ class FastAPIEnvServer(EnvironmentServer):
             async def grouped_rollouts(
                 request: RemoteGroupedRolloutRequest,
             ) -> list[list[TokenRollout]]:
+                print(f"[ENV /grouped_rollouts/] groups={request.num_groups} host={getattr(request.inference_interface, 'host', '?')}:{getattr(request.inference_interface, 'port', '?')}", flush=True)
                 env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                request.inference_interface = _safe_unwrap(request.inference_interface)
                 return await env.get_grouped_rollouts(request)
 
         if issubclass(env_cls, ContrastiveRolloutGenerator):
@@ -67,7 +76,7 @@ class FastAPIEnvServer(EnvironmentServer):
                 request: RemoteRolloutRequest,
             ) -> list[ContrastiveRollout]:
                 env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                request.inference_interface = _safe_unwrap(request.inference_interface)
                 return await env.get_contrastive_rollouts(request)
 
         if issubclass(env_cls, RolloutGenerator):
@@ -75,7 +84,7 @@ class FastAPIEnvServer(EnvironmentServer):
             @app.post("/rollouts/")
             async def rollouts(request: RemoteRolloutRequest) -> list[TokenRollout]:
                 env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                request.inference_interface = _safe_unwrap(request.inference_interface)
                 return await env.get_reward_rollouts(request)
 
         if issubclass(env_cls, EvaluationAgent):
@@ -83,7 +92,7 @@ class FastAPIEnvServer(EnvironmentServer):
             @app.post("/evaluation/")
             async def run_evaluation(request: RemoteEvaluationRequest):
                 env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                request.inference_interface = _safe_unwrap(request.inference_interface)
                 return await env.run_evaluation(request)
 
         loop = asyncio.get_event_loop()
@@ -126,14 +135,17 @@ class FastAPIEnvServer(EnvironmentServer):
     ) -> AsyncGenerator[list[TokenRollout], None]:
         assert isinstance(
             request.inference_interface, InferenceServer
-        ), "Rollout requests to remote server must contain an InferenceServer object"
+        ), f"Rollout requests to remote server must contain an InferenceServer object, got {type(request.inference_interface)}"
         assert request.num_groups != -1, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
-        payload["inference_interface"] = request.inference_interface.model_dump()
+        iface_dump = request.inference_interface.model_dump()
+        payload["inference_interface"] = iface_dump
+        print(f"[GPU->ENV] POST {self.env_server_host_port}/grouped_rollouts/ groups={request.num_groups}", flush=True)
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"http://{self.env_server_host_port}/grouped_rollouts/", json=payload, timeout=None
             )
+        print(f"[GPU->ENV] Response: {response.status_code}", flush=True)
         rollouts = [[TokenRollout.model_validate(r) for r in group] for group in response.json()]
         for rollout in rollouts:
             yield rollout

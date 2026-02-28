@@ -339,6 +339,10 @@ class DataParallelInferenceCoordinator:
                 tokens to be detokenized. It is modified in place.
         """
         for request in finished_request_record["requests"]:
+            if request.get("status") == "FAILED":
+                if request.get("generated_text") is None:
+                    request["generated_text"] = ""
+                continue
             if request["prompt"] is None:
                 request["prompt"] = self.tokenizer.detokenize(request["prompt_tokens"][1])
             request["generated_text"] = self.tokenizer.detokenize(request["generated_tokens"])

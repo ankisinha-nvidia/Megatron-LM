@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import socket
 
 import torch.distributed as dist
 from pydantic import PrivateAttr
@@ -45,9 +46,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         from openai import AsyncOpenAI
         client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
 
-        # Things that may be problematic when doign this switch
-        # - Add BOS token
-        # - Skip prompt logprobs
         response = await client.chat.completions.create(
             model="",
             messages=[message.model_dump() for message in request.prompt],
@@ -105,14 +103,18 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
                 flask_port=kwargs.get('port', 8294),
-                parsers=[],
+                parsers=["deepseek-r1-reasoning", "qwen3-coder-tool"],
                 verbose=kwargs.get('verbose', False),
             ))
         else:
             client = None
             server_task = None
             
-        launched_server = cls(**kwargs)
+        actual_ip = socket.gethostbyname(socket.gethostname())
+        launch_kwargs = dict(kwargs)
+        launch_kwargs['host'] = actual_ip
+        launch_kwargs.setdefault('port', kwargs.get('port', 8294))
+        launched_server = cls(**launch_kwargs)
         launched_server._client = client
         launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine

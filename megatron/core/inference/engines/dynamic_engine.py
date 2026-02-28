@@ -788,8 +788,14 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.failed_request_ids.append(request_id)
             if self.rank == 0:
+                _events = getattr(request, 'events', []) or []
+                _err_details = "; ".join(str(e) for e in _events) if _events else "unknown"
                 warnings.warn(
-                    f"Request {request_id} failed to be added to the engine due to errors."
+                    f"Request {request_id} failed: prompt_len={len(request.prompt_tokens)}, "
+                    f"num_tokens_to_gen={request.sampling_params.num_tokens_to_generate}, "
+                    f"max_seq_len={self.context.max_sequence_length}, "
+                    f"max_tokens={self.context.max_tokens}, "
+                    f"events={_err_details}"
                 )
 
         return self.requests[request_id].future
@@ -1343,6 +1349,10 @@ class DynamicInferenceEngine(AbstractEngine):
             range_push("detokenization")
             for record in finished_request_records:
                 for request in record.requests:
+                    if request.status == Status.FAILED:
+                        if request.generated_text is None:
+                            request.generated_text = ""
+                        continue
                     if request.prompt is None:
                         request.prompt = self.controller.tokenizer.detokenize(
                             request.prompt_tokens.tolist()
@@ -1670,6 +1680,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
+                                or self.failed_request_ids
                             )
                         )
                     )
@@ -1738,7 +1749,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 local_pending_requests = self.context.get_active_request_count() + len(
                     self.waiting_request_ids
-                )
+                ) + len(self.failed_request_ids)
                 # 1. Check for work availability (Consensus Step)
                 ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
 

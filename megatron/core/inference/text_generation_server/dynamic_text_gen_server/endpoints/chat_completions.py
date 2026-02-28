@@ -7,6 +7,7 @@ import traceback
 import uuid
 import warnings
 
+from megatron.core.inference.inference_request import Status
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -36,25 +37,19 @@ try:
 
         try:
             prompt_tokens = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
-            )
-        except (AttributeError, AssertionError):
-            warnings.warn(
-                "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
-            )
-            prompt_tokens = tokenizer.tokenize(
-                "\n".join([message["content"] for message in messages])
+                messages, tokenize=True, add_generation_prompt=True,
+                tools=req.get("tools", None),
             )
         except Exception as e:
-            logger.error(f"{traceback.format_exc()}")
+            logger.error(f"apply_chat_template failed: {e}\n{traceback.format_exc()}")
             return f"Error processing 'messages': {e}", 500
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
+            temperature = float(req.get("temperature") or 1.0)
+            top_p = float(req.get("top_p") or 1.0)
+            top_k = int(req.get("top_k") or 0)
+            n = int(req.get("n") or 1)
 
             if temperature == 0.0:
                 top_k = 1
@@ -94,18 +89,29 @@ try:
 
         # --- 3. Send Requests to Engine ---
         # For chat, we run the *same* prompt 'n' times.
+        logger.warning(f"[ChatCompletions] Received request: prompt_tokens={len(prompt_tokens)}, "
+                        f"max_tokens={req.get('max_tokens')}, n={n}, temp={temperature}")
         tasks = []
         for _ in range(n):
             tasks.append(client.add_request(prompt_tokens, sampling_params))
 
-        if current_app.config['verbose']:
-            start_time = time.perf_counter()
+        start_time = time.perf_counter()
 
         try:
-            batch_results = await asyncio.gather(*tasks)
+            batch_results = await asyncio.wait_for(
+                asyncio.gather(*tasks), timeout=900.0
+            )
+        except asyncio.TimeoutError:
+            elapsed = time.perf_counter() - start_time
+            logger.error(f"[ChatCompletions] Inference timed out after {elapsed:.1f}s (prompt_tokens={len(prompt_tokens)})")
+            return "Inference timed out after 900s", 500
         except Exception as e:
-            logger.error(f"Error during inference: {e}")
+            elapsed = time.perf_counter() - start_time
+            logger.error(f"[ChatCompletions] Error after {elapsed:.1f}s: {e}")
             return f"Error during inference: {e}", 500
+
+        gather_elapsed = time.perf_counter() - start_time
+        logger.warning(f"[ChatCompletions] Engine returned {len(batch_results)} results in {gather_elapsed:.1f}s")
 
         if current_app.config['verbose']:
             logging.info(
@@ -120,6 +126,17 @@ try:
 
         request_idx = 0
         for record in batch_results:
+            last_req = record[-1]
+            if last_req.status == Status.FAILED:
+                _events = getattr(last_req, 'events', []) or []
+                logger.error(f"Request in batch failed (events={_events})")
+                choices.append({
+                    "index": request_idx,
+                    "message": {"role": "assistant", "content": "[INFERENCE FAILED]"},
+                    "finish_reason": "error",
+                })
+                request_idx += 1
+                continue
             result = record.merge().serialize()
             # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
             result = {
@@ -222,7 +239,8 @@ try:
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
-        prompt_token_count = max(prompt_tokens_counts)
+        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        total_elapsed = time.perf_counter() - start_time
         response = {
             "id": str(uuid.uuid4()),
             "created": int(time.time()),
@@ -235,6 +253,9 @@ try:
                 "total_tokens": prompt_token_count + total_completion_tokens,
             },
         }
+        logger.warning(f"[ChatCompletions] Returning {len(choices)} choices "
+                        f"(prompt={prompt_token_count}, completion={total_completion_tokens}) "
+                        f"in {total_elapsed:.1f}s")
         return jsonify(response)
 
 except ImportError as e:
