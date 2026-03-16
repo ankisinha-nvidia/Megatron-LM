@@ -133,6 +133,10 @@ class FastAPIEnvServer(EnvironmentServer):
     async def get_grouped_rollouts(
         self, request: GroupedRolloutRequest
     ) -> AsyncGenerator[list[TokenRollout], None]:
+        print(f"[GPU->ENV] get_grouped_rollouts called: num_groups={request.num_groups} "
+              f"rollouts_per_group={request.rollouts_per_group} "
+              f"iface_type={type(request.inference_interface).__name__} "
+              f"target={self.env_server_host_port}", flush=True)
         assert isinstance(
             request.inference_interface, InferenceServer
         ), f"Rollout requests to remote server must contain an InferenceServer object, got {type(request.inference_interface)}"
@@ -140,13 +144,20 @@ class FastAPIEnvServer(EnvironmentServer):
         payload = request.model_dump()
         iface_dump = request.inference_interface.model_dump()
         payload["inference_interface"] = iface_dump
-        print(f"[GPU->ENV] POST {self.env_server_host_port}/grouped_rollouts/ groups={request.num_groups}", flush=True)
+        print(f"[GPU->ENV] POST http://{self.env_server_host_port}/grouped_rollouts/ groups={request.num_groups} payload_keys={list(payload.keys())}", flush=True)
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"http://{self.env_server_host_port}/grouped_rollouts/", json=payload, timeout=None
             )
-        print(f"[GPU->ENV] Response: {response.status_code}", flush=True)
+        print(f"[GPU->ENV] Response: {response.status_code} len={len(response.content)}", flush=True)
+        if response.status_code != 200:
+            print(f"[GPU->ENV] ERROR: Server returned {response.status_code}: "
+                  f"{response.text[:500]}", flush=True)
+            raise RuntimeError(
+                f"Environment server returned HTTP {response.status_code} for grouped_rollouts"
+            )
         rollouts = [[TokenRollout.model_validate(r) for r in group] for group in response.json()]
+        print(f"[GPU->ENV] Parsed {len(rollouts)} rollout groups", flush=True)
         for rollout in rollouts:
             yield rollout
 

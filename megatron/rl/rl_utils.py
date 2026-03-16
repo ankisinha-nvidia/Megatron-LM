@@ -457,10 +457,13 @@ _ROLLOUT_GENERATOR = None
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
     if not args.rl_partial_rollouts or _ROLLOUT_GENERATOR is None:
+        print(f"[DEBUG-RL] get_rollout_generator: creating new generator", flush=True)
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
-        # Collect Rollouts
+        print(f"[DEBUG-RL] agent type: {type(agent)}", flush=True)
+        num_groups = -1 if args.rl_partial_rollouts else n_prompts
+        print(f"[DEBUG-RL] num_groups={num_groups} rollouts_per_group={samples_per_group} partial={args.rl_partial_rollouts}", flush=True)
         request = GroupedRolloutRequest(
-            num_groups=-1 if args.rl_partial_rollouts else n_prompts,
+            num_groups=num_groups,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
@@ -471,7 +474,9 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
         )
+        print(f"[DEBUG-RL] request created, calling agent.get_grouped_rollouts()...", flush=True)
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
+        print(f"[DEBUG-RL] generator obtained: {type(_ROLLOUT_GENERATOR)}", flush=True)
     return _ROLLOUT_GENERATOR
 
 
@@ -538,9 +543,11 @@ def get_environment_rollouts(
 
             with nvtx_range("inference-setup"):
                 # Asyncronously run inference and rollout collection
+                print(f"[DEBUG-RL] inference-setup: n_prompts={n_prompts} samples_per_group={samples_per_group} partial={args.rl_partial_rollouts}", flush=True)
                 rollout_generator = get_rollout_generator(
                     args, inference_interface, n_prompts, samples_per_group
                 )
+                print(f"[DEBUG-RL] rollout_generator created: {type(rollout_generator)}", flush=True)
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()
@@ -551,9 +558,13 @@ def get_environment_rollouts(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    rollouts = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
-                    ]
+                    print(f"[DEBUG-RL] Starting anext() loop for {n_prompts} prompts...", flush=True)
+                    rollouts = []
+                    for i in range(n_prompts):
+                        print(f"[DEBUG-RL] anext() call {i+1}/{n_prompts}...", flush=True)
+                        rollout = loop.run_until_complete(anext(rollout_generator))
+                        print(f"[DEBUG-RL] anext() call {i+1}/{n_prompts} returned {len(rollout)} rollouts", flush=True)
+                        rollouts.append(rollout)
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
