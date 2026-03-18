@@ -708,9 +708,7 @@ class SequencePacker:
         position_ids = torch.zeros(
             (num_bins, self.bin_size), dtype=torch.long, device=device, requires_grad=False
         )
-        attention_mask = torch.zeros(
-            (num_bins, 1, self.bin_size, self.bin_size), dtype=torch.bool, device=device
-        )
+        attention_mask = None
         loss_mask = torch.zeros((num_bins, self.bin_size), dtype=torch.float, device=device)
 
         # Track packing information for unpacking later
@@ -743,7 +741,8 @@ class SequencePacker:
 
                 # Causal attention mask within each sequence
                 seq_len = end - start
-                attention_mask[bin_idx, 0, start:end, start:end] = torch.tril(
+                if attention_mask is not None:
+                    attention_mask[bin_idx, 0, start:end, start:end] = torch.tril(
                     torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
                 )
 
@@ -765,7 +764,8 @@ class SequencePacker:
         # (it depends on the original trajectories passed to pack_sequences)
 
         # Invert attention mask, before inversion: (True = attend, False = mask)
-        attention_mask.bitwise_not_()
+        if attention_mask is not None:
+            attention_mask.bitwise_not_()
 
         # Create the PackingInfo dataclass
         packing_info = PackingInfo(

@@ -15,7 +15,10 @@ import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
-from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.inference_request import (
+    compute_block_hashes_batched,
+    unwrap_serialized_tensors,
+)
 
 try:
     import zmq
@@ -500,14 +503,26 @@ class DataParallelInferenceCoordinator:
             finished_request (dict): The serialized merged request containing the
                 generated tokens to be detokenized. It is modified in place.
         """
-        for request in finished_request_record["requests"]:
+        if "requests" in finished_request:
+            request_payloads = finished_request["requests"]
+        else:
+            request_payloads = [finished_request]
+
+        for i, request in enumerate(request_payloads):
+            if isinstance(request, dict):
+                request_payloads[i] = request = unwrap_serialized_tensors(request)
             if request.get("status") == "FAILED":
                 if request.get("generated_text") is None:
                     request["generated_text"] = ""
                 continue
-            if request["prompt"] is None:
-                request["prompt"] = self.tokenizer.detokenize(request["prompt_tokens"][1])
-            request["generated_text"] = self.tokenizer.detokenize(request["generated_tokens"])
+
+            prompt_tokens = request.get("prompt_tokens")
+            generated_tokens = request.get("generated_tokens")
+
+            if request.get("prompt") is None and prompt_tokens is not None:
+                request["prompt"] = self.tokenizer.detokenize(prompt_tokens)
+            if generated_tokens is not None:
+                request["generated_text"] = self.tokenizer.detokenize(generated_tokens)
 
     @classmethod
     def entrypoint(

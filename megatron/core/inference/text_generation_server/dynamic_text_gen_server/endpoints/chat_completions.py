@@ -182,6 +182,8 @@ try:
 
     def apply_parsers(message_text, tools, parsers_list, tools_requested):
         """Runs CPU-intensive text parsing."""
+        if message_text is None:
+            message_text = ""
         meta = {}
         for parser in parsers_list:
             if parser not in PARSER_MAPPING:
@@ -249,6 +251,19 @@ try:
 
                     eos_token_id = tokenizer.eos_id
                     assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+                    truncation_marker_present = any(
+                        isinstance(message.get("content"), str)
+                        and "[Previous " in message["content"]
+                        and "truncated to fit context window]" in message["content"]
+                        for message in template_messages
+                    )
+                    assistant_count = sum(1 for message in template_messages if message.get("role") == "assistant")
+                    logger.warning(
+                        "prevent_retokenization=True msgs=%s assistant_messages=%s truncation_marker=%s",
+                        len(template_messages),
+                        assistant_count,
+                        truncation_marker_present,
+                    )
 
                     warnings.warn(
                         "Avoiding prefix retokenization."
@@ -392,6 +407,12 @@ try:
 
             prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
+            if (text_output is None or text_output == "") and result.get("generated_tokens"):
+                try:
+                    text_output = tokenizer.detokenize(result["generated_tokens"])
+                except Exception:
+                    logger.exception("Failed fallback detokenization for generated_tokens")
+                    text_output = text_output or ""
             prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
 
@@ -430,7 +451,7 @@ try:
                     )
 
             metadata = {}
-            message_text = text_output
+            message_text = text_output or ""
 
             if parsers:
                 message_text, metadata = apply_parsers(
@@ -462,7 +483,7 @@ try:
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
                 "generation_log_probs": result.get("generated_log_probs", []),
-                "raw_text": result["prompt"] + result["generated_text"],
+                "raw_text": (result["prompt"] or "") + (text_output or ""),
                 # 'logprobs' in chat API is an object containing 'content'
                 # "logprobs": {"content": logprobs_content} if logprobs_content else None,
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
@@ -470,6 +491,12 @@ try:
             }
             choice_data["policy_staleness"] = result["policy_staleness"]
             choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            try:
+                from megatron.training.global_vars import get_args
+
+                choice_data["completed_at_step"] = getattr(get_args(), "curr_iteration", 0)
+            except Exception:
+                choice_data["completed_at_step"] = 0
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )

@@ -20,6 +20,8 @@ class DeepSeekR1ReasoningParser(BaseParser):
             tuple[str, dict[str, str]]: A tuple containing the unprocessed text
             and a dictionary with the extracted reasoning content.
         """
+        if text is None:
+            return "", {}
 
         if "</think>" in text:
             if "<think>" in text:
