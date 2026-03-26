@@ -52,6 +52,8 @@ class Rollout(AgentBaseModel):
     kv_cache_staleness: list[list[int]]
     completed_at_step: list[int]
     num_evictions: list[int]
+    rollout_duration_ms: int | None = None
+    inference_duration_ms: int | None = None
 
 
 class TokenRollout(AgentBaseModel):
@@ -67,6 +69,8 @@ class TokenRollout(AgentBaseModel):
     kv_cache_staleness: list[list[int]]
     completed_at_step: list[int]
     num_evictions: list[int]
+    rollout_duration_ms: int | None = None
+    inference_duration_ms: int | None = None
 
 
 class ContrastiveRollout(AgentBaseModel):

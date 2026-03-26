@@ -39,6 +39,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     host: str
     port: int
+    context_window: int | None = None
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
@@ -125,6 +126,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launch_kwargs = dict(kwargs)
         launch_kwargs['host'] = actual_ip
         launch_kwargs.setdefault('port', kwargs.get('port', 8294))
+        launch_kwargs.setdefault(
+            'context_window',
+            getattr(args, 'inference_max_seq_length', None)
+            or getattr(args, 'seq_length', None)
+            or getattr(args, 'max_position_embeddings', None),
+        )
         launched_server = cls(**launch_kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine

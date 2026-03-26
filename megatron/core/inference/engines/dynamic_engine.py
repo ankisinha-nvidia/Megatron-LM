@@ -271,6 +271,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_counter = Counter()
         self.finished_request_count = 0
         self.evicted_request_count = 0
+        self.finished_prompt_token_count_total = 0
+        self.finished_generated_token_count_total = 0
+        self.finished_prompt_token_count_since_log = 0
+        self.finished_generated_token_count_since_log = 0
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
@@ -1663,6 +1667,18 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.send(payload)
             range_pop()
 
+        finished_prompt_tokens_this_step = 0
+        finished_generated_tokens_this_step = 0
+        for record in finished_request_records:
+            merged_request = record.merge()
+            finished_prompt_tokens_this_step += len(merged_request.prompt_tokens)
+            finished_generated_tokens_this_step += merged_request.generated_length
+
+        self.finished_prompt_token_count_total += finished_prompt_tokens_this_step
+        self.finished_generated_token_count_total += finished_generated_tokens_this_step
+        self.finished_prompt_token_count_since_log += finished_prompt_tokens_this_step
+        self.finished_generated_token_count_since_log += finished_generated_tokens_this_step
+
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
@@ -1674,6 +1690,31 @@ class DynamicInferenceEngine(AbstractEngine):
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
+                'inference/active_token_count': int(context_state["active_token_count"]),
+                'inference/padded_active_token_count': int(
+                    context_state["padded_active_token_count"]
+                ),
+                'inference/finished_request_count_total': int(self.finished_request_count),
+                'inference/finished_prompt_tokens_total': int(
+                    self.finished_prompt_token_count_total
+                ),
+                'inference/finished_generated_tokens_total': int(
+                    self.finished_generated_token_count_total
+                ),
+                'inference/finished_total_tokens_total': int(
+                    self.finished_prompt_token_count_total
+                    + self.finished_generated_token_count_total
+                ),
+                'inference/finished_prompt_tokens_since_log': int(
+                    self.finished_prompt_token_count_since_log
+                ),
+                'inference/finished_generated_tokens_since_log': int(
+                    self.finished_generated_token_count_since_log
+                ),
+                'inference/finished_total_tokens_since_log': int(
+                    self.finished_prompt_token_count_since_log
+                    + self.finished_generated_token_count_since_log
+                ),
             }
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
@@ -1707,6 +1748,7 @@ class DynamicInferenceEngine(AbstractEngine):
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
+                "tokens: a %d, pad %d, fin(prompt/gen) %d/%d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
@@ -1732,6 +1774,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
                     context_state["evicted_request_count"],
+                    context_state["active_token_count"],
+                    context_state["padded_active_token_count"],
+                    self.finished_prompt_token_count_since_log,
+                    self.finished_generated_token_count_since_log,
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
@@ -1758,6 +1804,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._spec_tokens_proposed = 0
                 self._spec_tokens_accepted = 0
                 self._spec_steps = 0
+            self.finished_prompt_token_count_since_log = 0
+            self.finished_generated_token_count_since_log = 0
 
         return {
             "active_request_ids": active_request_ids,

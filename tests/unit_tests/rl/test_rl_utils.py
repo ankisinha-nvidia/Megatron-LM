@@ -931,6 +931,8 @@ class TestRLUtils:
         traj_lens = [[3, 3], [1, 2]]
         turn_lens = [[1, 2, 1, 1, 1], [1, 2]]
         rewards = [[1, 1], [-1, 2]]
+        rollout_duration_ms = [[1000, 2000], [3000, 5000]]
+        inference_duration_ms = [[100, 200], [300, 700]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
         # Per-token staleness (6 tokens in group 1, 3 in group 2; matching turn_lens)
@@ -945,6 +947,8 @@ class TestRLUtils:
             traj_lens,
             turn_lens,
             rewards,
+            rollout_duration_ms,
+            inference_duration_ms,
             num_turns,
             advantages,
             policy_staleness=policy_staleness,
@@ -954,6 +958,12 @@ class TestRLUtils:
             current_iteration=current_iteration,
         )
         assert metrics["mean_reward"] == 0.75
+        assert metrics["mean_rollout_duration_ms"] == 2750.0
+        assert metrics["max_rollout_duration_ms"] == 5000
+        assert metrics["min_rollout_duration_ms"] == 1000
+        assert metrics["mean_inference_duration_ms"] == 325.0
+        assert metrics["max_inference_duration_ms"] == 700
+        assert metrics["min_inference_duration_ms"] == 100
         assert metrics["mean_advantage"] == 0.5
         assert metrics["nonzero_groups_ratio"] == 0.5
         assert metrics["max_traj_length"] == 3

@@ -23,13 +23,19 @@ class DeepSeekR1ReasoningParser(BaseParser):
         if text is None:
             return "", {}
 
-        if "</think>" in text:
-            if "<think>" in text:
-                # Strip the <think> prefix (it might not be present if it was part of the prompt)
-                pre_text, text = text.split("<think>", maxsplit=1)
-            else:
-                pre_text = ""
-            reasoning_content, remaining_text = text.split("</think>", maxsplit=1)
-            return pre_text + remaining_text, {'reasoning': reasoning_content}
-        else:
+        close_idx = text.find("</think>")
+        if close_idx == -1:
             return text, {}
+
+        open_idx = text.find("<think>")
+        if 0 <= open_idx < close_idx:
+            pre_text = text[:open_idx]
+            reasoning_content = text[open_idx + len("<think>") : close_idx]
+            remaining_text = text[close_idx + len("</think>") :]
+            return pre_text + remaining_text, {'reasoning': reasoning_content}
+
+        # If the opening tag is missing or appears after the closing tag,
+        # infer that reasoning started at the beginning of the text.
+        reasoning_content = text[:close_idx]
+        remaining_text = text[close_idx + len("</think>") :]
+        return remaining_text, {'reasoning': reasoning_content}

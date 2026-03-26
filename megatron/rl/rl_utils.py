@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import resource
 
 import copy
 from functools import partial
@@ -79,6 +80,7 @@ from megatron.training.global_vars import (
     get_wandb_writer,
 )
 from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
     print_rank_0,
@@ -96,6 +98,15 @@ if HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
 logger = logging.getLogger(__name__)
+
+
+def _log_rss(label: str) -> None:
+    """Log current RSS in GB for the calling process."""
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_gb = rss_kb / (1024 * 1024)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(f"[RSS] rank={rank} {label}: {rss_gb:.2f} GB (maxrss)", flush=True)
+
 
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
@@ -274,6 +285,8 @@ class RolloutStats:
     env_ids: list[str] # same length as len(rewards)
     turn_lens: list[list[int]] # token lengths of turns, grouped.
     traj_lens: list[list[int]] # all turns comprise one trajectory.
+    rollout_duration_ms: None | list[list[int]] # grouped per rollout
+    inference_duration_ms: None | list[list[int]] # grouped per rollout
     num_turns: None | list[list[int]] # num_turns per traj
     advantages: None | list[list[float]]
     min_piold_to_inf_prob: None | float
@@ -468,7 +481,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             inference_interface=inference_interface,
             generation_args={
                 'temperature': args.rl_default_temperature,
-                'max_tokens': args.inference_max_seq_length,
+                'max_tokens': min(args.num_tokens_to_generate, args.inference_max_seq_length),
                 'top_p': args.rl_default_top_p,
                 'top_k': args.rl_default_top_k,
             },
@@ -530,7 +543,7 @@ def get_environment_rollouts(
     pg_size = get_pg_size(inference_pg_collection.ep)
     assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
 
-    with nvtx_range("rollout-collection"):
+    with nvtx_range("rollout-collection", time=True):
         loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
             inference_model,
@@ -541,7 +554,7 @@ def get_environment_rollouts(
             increment_staleness_on_suspend=True,
         ) as inference_interface:
 
-            with nvtx_range("inference-setup"):
+            with nvtx_range("inference-setup", time=True):
                 # Asyncronously run inference and rollout collection
                 print(f"[DEBUG-RL] inference-setup: n_prompts={n_prompts} samples_per_group={samples_per_group} partial={args.rl_partial_rollouts}", flush=True)
                 rollout_generator = get_rollout_generator(
@@ -551,7 +564,7 @@ def get_environment_rollouts(
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()
-            with nvtx_range("collect-rollouts"):
+            with nvtx_range("collect-rollouts", time=True):
                 if rank == 0:
                     log_single_rank(
                         logger,
@@ -580,10 +593,12 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
+        _log_rss("before broadcast_object_list")
         with nvtx_range("sync-rollouts"):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
+        _log_rss("after broadcast_object_list")
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
@@ -644,7 +659,75 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def cp_split_rl_batch(
+    tokens,
+    position_ids,
+    pad_token,
+    old_logprobs=None,
+    ref_logprobs=None,
+    loss_mask=None,
+    inference_logprobs=None,
+):
+    """Prepare and context-parallel split a non-packed RL batch."""
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return None
+
+    seq_length = tokens.shape[1]
+    labels = torch.cat(
+        [
+            tokens[:, 1:],
+            torch.full((tokens.shape[0], 1), pad_token, dtype=tokens.dtype, device=tokens.device),
+        ],
+        dim=1,
+    )
+
+    batch = {"tokens": tokens, "position_ids": position_ids, "labels": labels}
+    for name, tensor in (
+        ("old_logprobs", old_logprobs),
+        ("ref_logprobs", ref_logprobs),
+        ("loss_mask", loss_mask),
+        ("inference_logprobs", inference_logprobs),
+    ):
+        if tensor is None:
+            continue
+        if tensor.shape[1] < seq_length:
+            tensor = torch.nn.functional.pad(tensor, (0, seq_length - tensor.shape[1]))
+        batch[name] = tensor
+
+    return get_batch_on_this_cp_rank(batch)
+
+
+def cp_gather_logprobs(local_logprobs):
+    """All-gather and un-zigzag CP-local logprobs back to [B, S-1]."""
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return local_logprobs
+
+    gathered = [torch.empty_like(local_logprobs) for _ in range(cp_size)]
+    torch.distributed.all_gather(
+        gathered, local_logprobs.contiguous(), group=mpu.get_context_parallel_group()
+    )
+
+    chunk_size = local_logprobs.shape[1] // 2
+    full_chunks = [None] * (2 * cp_size)
+    for rank, rank_logprobs in enumerate(gathered):
+        first, second = rank_logprobs.split(chunk_size, dim=1)
+        full_chunks[rank] = first
+        full_chunks[2 * cp_size - rank - 1] = second
+
+    return torch.cat(full_chunks, dim=1)[:, :-1]
+
+
+def get_logprobs(
+    model,
+    tokens,
+    position_ids,
+    no_grad=False,
+    sequence_packing=False,
+    packed_seq_params=None,
+    labels=None,
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -665,12 +748,16 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
-    # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
-    # When sequence_packing is disabled, construct a single-sequence default so the CUDA
-    # graph signature matches the training forward_step in train_rl.py.
-    # This is necessary because reference logprobs steps will reuse the training forward graph.
-    if packed_seq_params is None:
+    # For non-packed RL with CP>1, we intentionally keep packed_seq_params=None to stay on the
+    # SBHD path so RoPE/attention use the same zigzag CP partitioning as the split batch.
+    use_cp_nonpacked_path = (
+        labels is not None
+        and not sequence_packing
+        and mpu.get_context_parallel_world_size() > 1
+    )
+
+    # Otherwise keep the existing THD defaults for CUDA-graph signature consistency.
+    if packed_seq_params is None and not use_cp_nonpacked_path:
         if sequence_packing:
             packed_seq_params = get_default_packed_seq_params(
                 seq_length=tokens.shape[1],
@@ -719,8 +806,11 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         else:
             logits = logits_or_hidden_states
             with nvtx_range("log-softmax", time=False):
-                # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                if labels is not None:
+                    logprobs = selective_log_softmax(logits, labels)
+                else:
+                    # We do not need logprobs for the n+1 token.
+                    logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
             return logprobs
 
 
@@ -769,6 +859,8 @@ def compute_group_stats(
     group_reward_stds = []
     turn_lens = []
     traj_lens = []
+    rollout_duration_ms = []
+    inference_duration_ms = []
     rewards = []
     env_ids = []
     group_reward_ids = []
@@ -782,6 +874,8 @@ def compute_group_stats(
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
+        group_rollout_durations = []
+        group_inference_durations = []
         group_policy_staleness = []
         group_kv_staleness = []
         group_completed_at_steps = []
@@ -803,6 +897,10 @@ def compute_group_stats(
                 )
             group_num_turns.append(len(rollout.trajectory))
             group_rewards.append(rollout.reward)
+            if getattr(rollout, "rollout_duration_ms", None) is not None:
+                group_rollout_durations.append(int(rollout.rollout_duration_ms))
+            if getattr(rollout, "inference_duration_ms", None) is not None:
+                group_inference_durations.append(int(rollout.inference_duration_ms))
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
@@ -816,6 +914,8 @@ def compute_group_stats(
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
+        rollout_duration_ms.append(group_rollout_durations)
+        inference_duration_ms.append(group_inference_durations)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
         rewards.append(group_rewards)
         # https://arxiv.org/abs/2504.21233 reports that lens variance hurts.
@@ -825,6 +925,8 @@ def compute_group_stats(
     stats = RolloutStats(
         traj_lens=traj_lens,
         turn_lens=turn_lens,
+        rollout_duration_ms=rollout_duration_ms,
+        inference_duration_ms=inference_duration_ms,
         rewards=rewards,
         # --------
         # Everything above is per-group, i.e. it is a list of lists,
@@ -884,6 +986,8 @@ def prep_wandb_metrics(
         traj_lens: List[List[int]],
         turn_lens: List[List[int]],
         rewards: List[List[float]],
+        rollout_duration_ms: List[List[int]] | None,
+        inference_duration_ms: List[List[int]] | None,
         num_turns: List[List[int]],
         advantages: List[float],
         policy_staleness: List[List[int]],
@@ -902,6 +1006,8 @@ def prep_wandb_metrics(
         traj_lens: Grouped list of trajectory lengths.
         turn_lens: Grouped list of turn lengths.
         rewards: Grouped list of rewards.
+        rollout_duration_ms: Grouped list of rollout durations in milliseconds.
+        inference_duration_ms: Grouped list of summed LLM inference durations in milliseconds.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
         policy_staleness: Grouped list of per-token policy staleness.
@@ -922,6 +1028,8 @@ def prep_wandb_metrics(
         policy_staleness, completed_at_steps, turn_lens, current_iteration)
     true_kv_staleness = compute_true_staleness(
         kv_cache_staleness, completed_at_steps, turn_lens, current_iteration)
+    flat_rollout_durations = [d for group in (rollout_duration_ms or []) for d in group]
+    flat_inference_durations = [d for group in (inference_duration_ms or []) for d in group]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -975,6 +1083,14 @@ def prep_wandb_metrics(
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_at_steps for s in g]),
     }
+    if flat_rollout_durations:
+        metrics['mean_rollout_duration_ms'] = np.mean(flat_rollout_durations)
+        metrics['max_rollout_duration_ms'] = max(flat_rollout_durations)
+        metrics['min_rollout_duration_ms'] = min(flat_rollout_durations)
+    if flat_inference_durations:
+        metrics['mean_inference_duration_ms'] = np.mean(flat_inference_durations)
+        metrics['max_inference_duration_ms'] = max(flat_inference_durations)
+        metrics['min_inference_duration_ms'] = min(flat_inference_durations)
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
@@ -1030,6 +1146,8 @@ def maybe_log_training_metrics(
     traj_lens = group_stats.traj_lens
     turn_lens = group_stats.turn_lens
     rewards = group_stats.rewards
+    rollout_duration_ms = group_stats.rollout_duration_ms
+    inference_duration_ms = group_stats.inference_duration_ms
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
     policy_staleness = group_stats.policy_staleness
@@ -1038,7 +1156,9 @@ def maybe_log_training_metrics(
     completed_at_steps = group_stats.completed_at_steps
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
-        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
+        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, rollout_duration_ms=rollout_duration_ms,
+        inference_duration_ms=inference_duration_ms,
+        num_turns=num_turns, advantages=advantages,
         policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness, num_evictions=num_evictions,
         completed_at_steps=completed_at_steps, current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
@@ -1057,6 +1177,8 @@ def maybe_log_training_metrics(
         env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx),
             turn_lens=env_stats(turn_lens, env_idx),
             rewards=env_stats(rewards, env_idx),
+            rollout_duration_ms=env_stats(rollout_duration_ms, env_idx),
+            inference_duration_ms=env_stats(inference_duration_ms, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
             policy_staleness=env_stats(policy_staleness, env_idx),
@@ -1165,8 +1287,17 @@ def prepare_trajectories(
         for env_id, count in env_id_counts.items():
             logger.info(f"[{dist.get_rank()}] \t{env_id}: {count}")
 
+    _log_rss("before torch.tensor(generation_masks)")
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
+    _log_rss("before torch.tensor(trajs)")
     trajs = torch.tensor(trajs, device='cpu')
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        print(f"[MEM] trajs: shape={list(trajs.shape)} dtype={trajs.dtype} "
+              f"size={trajs.nelement() * trajs.element_size() / 1e6:.1f} MB", flush=True)
+        print(f"[MEM] generation_masks: shape={list(generation_masks.shape)} dtype={generation_masks.dtype} "
+              f"size={generation_masks.nelement() * generation_masks.element_size() / 1e6:.1f} MB", flush=True)
+    _log_rss("after torch.tensor(trajs+masks)")
 
     # Only process if we have inference_logprobs
     if inference_logprobs and any(lp is not None for lp in inference_logprobs):
@@ -1205,6 +1336,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     # the forward pass from training after it has been captured on the 1st iteration.
     model.eval()
 
+    labels = None
     if packing_context is not None:
         # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
         bin_tensor = next(data_iterator)[0]
@@ -1212,19 +1344,36 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
             load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
         )
+        tokens = b_trajs.cuda()
+        position_ids = b_posids.cuda()
     else:
         b_trajs, b_posids = next(data_iterator)
+        tokens = b_trajs.cuda()
+        position_ids = b_posids.cuda()
         b_packed_seq_params = None
+        cp_batch = cp_split_rl_batch(tokens, position_ids, get_tokenizer().pad)
+        if cp_batch is not None:
+            tokens = cp_batch["tokens"]
+            position_ids = cp_batch["position_ids"]
+            labels = cp_batch["labels"]
+
+    logprobs_result = get_logprobs(
+        model,
+        tokens,
+        position_ids,
+        no_grad=True,
+        sequence_packing=packing_context is not None,
+        packed_seq_params=b_packed_seq_params,
+        labels=labels,
+    )
+
+    if labels is not None:
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
+        if is_pp_last_stage(pg_collection.pp):
+            logprobs_result = cp_gather_logprobs(logprobs_result)
 
     logprobs = (
-        get_logprobs(
-            model,
-            b_trajs.cuda(),
-            b_posids.cuda(),
-            no_grad=True,
-            sequence_packing=packing_context is not None,
-            packed_seq_params=b_packed_seq_params,
-        ),
+        logprobs_result,
         None,
     )
     model.train()
@@ -1315,8 +1464,8 @@ def prepare_data_for_update(
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-    with nvtx_range("prepare-data-for-update"):
-        with nvtx_range("compute-group-stats"):
+    with nvtx_range("prepare-data-for-update", time=True):
+        with nvtx_range("compute-group-stats", time=True):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
@@ -1356,10 +1505,12 @@ def prepare_data_for_update(
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
+        _log_rss("before prepare_trajectories")
         with nvtx_range("prepare_trajectories"):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
+        _log_rss("after prepare_trajectories")
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
@@ -1383,7 +1534,9 @@ def prepare_data_for_update(
                 data_loader = DataLoader(dataset, batch_size=1)
                 logprobs_batch_size = 1
         else:
-            # Always compute standard masks for the original data (we'll need them later)
+            # RL only consumes loss_mask and position_ids here, so skip the
+            # dense attention mask allocation in the shared helper.
+            _log_rss("before build_rl_loss_mask_and_position_ids")
             with nvtx_range("get_ltor_masks_and_position_ids"):
                 _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
                     trajs,
@@ -1393,24 +1546,26 @@ def prepare_data_for_update(
                     args.reset_attention_mask,
                     eod_mask_loss=False,
                     pad_mask_loss=True,
+                    build_attention_mask=False,
                 )
                 original_loss_mask[~generation_masks] = 0.0
                 compute_trajs = trajs
                 compute_position_ids = original_position_ids
+                _log_rss("after build_rl_loss_mask_and_position_ids")
                 data_loader = DataLoader(
                     TensorDataset(compute_trajs, compute_position_ids),
                     batch_size=args.micro_batch_size,
                 )
                 logprobs_batch_size = args.micro_batch_size
 
+        _log_rss("before refit/toggle section")
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
+            # The RL logprob dataloader yields tuple batches, while FullCudaGraphWrapper's
+            # StaticBufferLoader expects dict-like inputs. Keep full-iteration CUDA graphs
+            # for the training step, but use the plain forward/backward path here.
             forward_backward_func = get_forward_backward_func()
-            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-                forward_backward_func = FullCudaGraphWrapper(
-                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
-                )
 
             dtype = (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -1419,6 +1574,7 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
+            _log_rss("before compute_old_logprobs")
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
                     model=model,
@@ -1433,12 +1589,15 @@ def prepare_data_for_update(
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
+            _log_rss("after compute_old_logprobs")
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+                _log_rss("before model.state_dict().cpu()")
                 # We need to load the ref model state dict and compute the logprobs for the ref model
                 cur_st_dict = {
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
                 }
+                _log_rss("after model.state_dict().cpu()")
                 model.load_state_dict(ref_state_dict)
                 ref_logprobs = compute_logprobs_batch(
                     model=model,
@@ -1456,6 +1615,7 @@ def prepare_data_for_update(
 
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
+                _log_rss("after compute_ref_logprobs")
 
             torch.cuda.synchronize()
             gc.collect()
@@ -1521,6 +1681,7 @@ def prepare_data_for_update(
                     # Nullify logprobs if not used in IS correction,
                     if not args.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
+            _log_rss("before create_dataloader")
             with nvtx_range("create_dataloader"):
                 # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
                 # As in sequence packing above, we need to reconfigure it too.
@@ -1535,21 +1696,44 @@ def prepare_data_for_update(
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
 
-                dataset_tensors = [
-                    compute_trajs,
-                    advantages,
-                    old_logprobs,
-                    original_loss_mask,
-                    original_position_ids,
-                    ref_logprobs,
-                ]
-                if is_correction and inference_logprobs is not None:
-                    dataset_tensors.append(inference_logprobs)
-                else:
-                    dataset_tensors.append(torch.zeros_like(old_logprobs))
-                data = TensorDataset(*dataset_tensors)
+                dataset_dict = {
+                    'tokens': compute_trajs,
+                    'advantages': advantages,
+                    'old_logprobs': old_logprobs,
+                    'loss_mask': original_loss_mask,
+                    'position_ids': original_position_ids,
+                    'ref_logprobs': ref_logprobs,
+                    'inference_logprobs': (
+                        inference_logprobs
+                        if is_correction and inference_logprobs is not None
+                        else torch.zeros_like(old_logprobs)
+                    ),
+                }
+
+                class DictTensorDataset(torch.utils.data.Dataset):
+                    def __init__(self, tensor_dict):
+                        first = next(iter(tensor_dict.values()))
+                        self._len = first.shape[0]
+                        self._dict = tensor_dict
+
+                    def __len__(self):
+                        return self._len
+
+                    def __getitem__(self, idx):
+                        return {k: v[idx] for k, v in self._dict.items()}
+
+                data = DictTensorDataset(dataset_dict)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                if rank == 0:
+                    total_bytes = 0
+                    for k, v in dataset_dict.items():
+                        nbytes = v.nelement() * v.element_size()
+                        total_bytes += nbytes
+                        print(f"[MEM] dataset_dict['{k}']: shape={list(v.shape)} dtype={v.dtype} size={nbytes / 1e6:.1f} MB", flush=True)
+                    print(f"[MEM] dataset_dict total: {total_bytes / 1e6:.1f} MB ({total_bytes / 1e9:.3f} GB)", flush=True)
+            _log_rss("after create_dataloader")
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
@@ -1673,7 +1857,7 @@ def evaluate_and_print_results_rl(
                     rank_info=None,
                     generation_args={
                         'temperature': args.rl_default_temperature,
-                        'max_tokens': args.seq_length,
+                        'max_tokens': min(args.num_tokens_to_generate, args.seq_length),
                         'top_p': args.rl_default_top_p,
                         'top_k': args.rl_default_top_k,
                     },
