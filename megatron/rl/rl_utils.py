@@ -82,6 +82,7 @@ from megatron.training.global_vars import (
     get_wandb_writer,
 )
 from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
     print_rank_0,
@@ -637,7 +638,75 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def cp_split_rl_batch(
+    tokens,
+    position_ids,
+    pad_token,
+    old_logprobs=None,
+    ref_logprobs=None,
+    loss_mask=None,
+    inference_logprobs=None,
+):
+    """Prepare and context-parallel split a non-packed RL batch."""
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return None
+
+    seq_length = tokens.shape[1]
+    labels = torch.cat(
+        [
+            tokens[:, 1:],
+            torch.full((tokens.shape[0], 1), pad_token, dtype=tokens.dtype, device=tokens.device),
+        ],
+        dim=1,
+    )
+
+    batch = {"tokens": tokens, "position_ids": position_ids, "labels": labels}
+    for name, tensor in (
+        ("old_logprobs", old_logprobs),
+        ("ref_logprobs", ref_logprobs),
+        ("loss_mask", loss_mask),
+        ("inference_logprobs", inference_logprobs),
+    ):
+        if tensor is None:
+            continue
+        if tensor.shape[1] < seq_length:
+            tensor = torch.nn.functional.pad(tensor, (0, seq_length - tensor.shape[1]))
+        batch[name] = tensor
+
+    return get_batch_on_this_cp_rank(batch)
+
+
+def cp_gather_logprobs(local_logprobs):
+    """All-gather and un-zigzag CP-local logprobs back to [B, S-1]."""
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return local_logprobs
+
+    gathered = [torch.empty_like(local_logprobs) for _ in range(cp_size)]
+    torch.distributed.all_gather(
+        gathered, local_logprobs.contiguous(), group=mpu.get_context_parallel_group()
+    )
+
+    chunk_size = local_logprobs.shape[1] // 2
+    full_chunks = [None] * (2 * cp_size)
+    for rank, rank_logprobs in enumerate(gathered):
+        first, second = rank_logprobs.split(chunk_size, dim=1)
+        full_chunks[rank] = first
+        full_chunks[2 * cp_size - rank - 1] = second
+
+    return torch.cat(full_chunks, dim=1)[:, :-1]
+
+
+def get_logprobs(
+    model,
+    tokens,
+    position_ids,
+    no_grad=False,
+    sequence_packing=False,
+    packed_seq_params=None,
+    labels=None,
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -658,12 +727,16 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
-    # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
-    # When sequence_packing is disabled, construct a single-sequence default so the CUDA
-    # graph signature matches the training forward_step in train_rl.py.
-    # This is necessary because reference logprobs steps will reuse the training forward graph.
-    if packed_seq_params is None:
+    # For non-packed RL with CP>1, keep packed_seq_params=None to stay on the SBHD path so
+    # RoPE and attention use the same zigzag CP partitioning as the split batch.
+    use_cp_nonpacked_path = (
+        labels is not None
+        and not sequence_packing
+        and mpu.get_context_parallel_world_size() > 1
+    )
+
+    # Otherwise keep the existing THD defaults for CUDA-graph signature consistency.
+    if packed_seq_params is None and not use_cp_nonpacked_path:
         if sequence_packing:
             packed_seq_params = get_default_packed_seq_params(
                 seq_length=tokens.shape[1],
@@ -712,8 +785,11 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         else:
             logits = logits_or_hidden_states
             with nvtx_range("rl/log-softmax", time=True):
-                # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                if labels is not None:
+                    logprobs = selective_log_softmax(logits, labels)
+                else:
+                    # We do not need logprobs for the n+1 token.
+                    logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
             return logprobs
 
 
@@ -1176,21 +1252,32 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
             load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
         )
+        labels = None
     else:
         b_trajs, b_posids = next(data_iterator)
+        tokens = b_trajs.cuda()
+        position_ids = b_posids.cuda()
+        labels = None
         b_packed_seq_params = None
+        cp_batch = cp_split_rl_batch(tokens, position_ids, get_tokenizer().pad)
+        if cp_batch is not None:
+            tokens = cp_batch["tokens"]
+            position_ids = cp_batch["position_ids"]
+            labels = cp_batch["labels"]
 
-    logprobs = (
-        get_logprobs(
-            model,
-            b_trajs.cuda(),
-            b_posids.cuda(),
-            no_grad=True,
-            sequence_packing=packing_context is not None,
-            packed_seq_params=b_packed_seq_params,
-        ),
-        None,
+    logprobs_result = get_logprobs(
+        model,
+        b_trajs.cuda() if packing_context is not None else tokens,
+        b_posids.cuda() if packing_context is not None else position_ids,
+        no_grad=True,
+        sequence_packing=packing_context is not None,
+        packed_seq_params=b_packed_seq_params,
+        labels=labels,
     )
+    if labels is not None and is_pp_last_stage(get_attr_wrapped_model(model, "pg_collection").pp):
+        logprobs_result = cp_gather_logprobs(logprobs_result)
+
+    logprobs = (logprobs_result, None)
     model.train()
     return logprobs
 
