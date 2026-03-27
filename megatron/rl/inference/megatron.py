@@ -38,6 +38,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     host: str
     port: int
+    context_window: int | None = None
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
@@ -119,7 +120,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         else:
             client = None
 
-        launched_server = cls(**kwargs)
+        context_window = getattr(args, "inference_max_seq_length", None)
+        if context_window is None:
+            context_window = getattr(args, "seq_length", None)
+        if context_window is None:
+            context_window = getattr(args, "max_position_embeddings", None)
+
+        launched_server = cls(context_window=context_window, **kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
