@@ -169,10 +169,23 @@ class GroupedRolloutGenerator(Agent, ABC):
     parallel_generation_tasks: int = 512
     buffer_size: int = 10
 
-    def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
+    def __init__(
+        self,
+        *,
+        parallel_generation_tasks: int | None = None,
+        buffer_size: int | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         if parallel_generation_tasks is not None:
             self.parallel_generation_tasks = parallel_generation_tasks
+        if buffer_size is not None:
+            self.buffer_size = buffer_size
+        elif parallel_generation_tasks is not None:
+            # In partial-rollout mode, a tiny queue starves producers and collapses
+            # decode concurrency into long-tail 1-3 active requests. Keep at least
+            # one queue slot per configured generation task.
+            self.buffer_size = max(self.buffer_size, parallel_generation_tasks)
 
     @abstractmethod
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...

@@ -40,8 +40,13 @@ class WeightedMultiTask(
 ):
     """An agent that manages multiple sub-agents and distributes rollouts according to weights."""
 
-    def __init__(self, agent_configs: list[AgentConfig]):
-        super().__init__()
+    def __init__(
+        self,
+        agent_configs: list[AgentConfig],
+        *,
+        parallel_generation_tasks: int | None = None,
+    ):
+        super().__init__(parallel_generation_tasks=parallel_generation_tasks)
         if not agent_configs:
             raise ValueError("Must provide at least one agent configuration")
 
@@ -98,7 +103,7 @@ class WeightedMultiTask(
                 )
             )
 
-        return cls(agent_configs)
+        return cls(agent_configs, parallel_generation_tasks=parallel_generation_tasks)
 
     def _distribute_counts(self, total_count: int, distribute_remainder: bool = True) -> list[int]:
         """Helper method to distribute counts according to weights.
@@ -184,9 +189,10 @@ class WeightedMultiTask(
         """Distribute grouped rollouts across sub-agents according to weights."""
         if request.num_groups > 0:
             agent_groups = self._distribute_counts(request.num_groups)
+            parallel_generation_tasks = min(self.parallel_generation_tasks, request.num_groups)
         else:
             agent_groups = [-1 if not agent.evaluation_only else 0 for agent in self.agent_configs]
-        parallel_generation_tasks = request.num_groups if request.num_groups > 0 else 10
+            parallel_generation_tasks = self.parallel_generation_tasks
         agent_slots = self._distribute_counts(parallel_generation_tasks, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
