@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import socket
 
 import copy
 from functools import partial
@@ -440,13 +441,18 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
 _INFERENCE_INTERFACE = None
 
 
+def _get_inference_server_host() -> str:
+    """Advertise the current node's reachable IP for the chat server."""
+    return socket.gethostbyname(socket.gethostname())
+
+
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
                 model[0],
-                host='0.0.0.0',
+                host=_get_inference_server_host(),
                 port=8294,
                 verbose=args.inference_text_gen_server_logging)
         )
@@ -467,7 +473,8 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             inference_interface=inference_interface,
             generation_args={
                 'temperature': args.rl_default_temperature,
-                'max_tokens': args.inference_max_seq_length,
+                # Cap generation by the configured new-token budget, not the full context window.
+                'max_tokens': min(args.num_tokens_to_generate, args.inference_max_seq_length),
                 'top_p': args.rl_default_top_p,
                 'top_k': args.rl_default_top_k,
             },
@@ -1444,6 +1451,7 @@ def prepare_data_for_update(
                     args.reset_attention_mask,
                     eod_mask_loss=False,
                     pad_mask_loss=True,
+                    create_attention_mask=False,
                 )
                 original_loss_mask[~generation_masks] = 0.0
                 compute_trajs = trajs
@@ -1459,10 +1467,6 @@ def prepare_data_for_update(
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
             forward_backward_func = get_forward_backward_func()
-            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-                forward_backward_func = FullCudaGraphWrapper(
-                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
-                )
 
             dtype = (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -1588,19 +1592,33 @@ def prepare_data_for_update(
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
 
-                dataset_tensors = [
-                    compute_trajs,
-                    advantages,
-                    old_logprobs,
-                    original_loss_mask,
-                    original_position_ids,
-                    ref_logprobs,
-                ]
-                if is_correction and inference_logprobs is not None:
-                    dataset_tensors.append(inference_logprobs)
-                else:
-                    dataset_tensors.append(torch.zeros_like(old_logprobs))
-                data = TensorDataset(*dataset_tensors)
+                dataset_dict = {
+                    'tokens': compute_trajs,
+                    'advantages': advantages,
+                    'old_logprobs': old_logprobs,
+                    'loss_mask': original_loss_mask,
+                    'position_ids': original_position_ids,
+                    'ref_logprobs': ref_logprobs,
+                    'inference_logprobs': (
+                        inference_logprobs
+                        if is_correction and inference_logprobs is not None
+                        else torch.zeros_like(old_logprobs)
+                    ),
+                }
+
+                class DictTensorDataset(torch.utils.data.Dataset):
+                    def __init__(self, tensor_dict):
+                        first = next(iter(tensor_dict.values()))
+                        self._len = first.shape[0]
+                        self._dict = tensor_dict
+
+                    def __len__(self):
+                        return self._len
+
+                    def __getitem__(self, idx):
+                        return {k: v[idx] for k, v in self._dict.items()}
+
+                data = DictTensorDataset(dataset_dict)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
         with nvtx_range("rl/log-wandb-tb", time=True):
@@ -1733,7 +1751,8 @@ def evaluate_and_print_results_rl(
                     rank_info=None,
                     generation_args={
                         'temperature': args.rl_default_temperature,
-                        'max_tokens': args.seq_length,
+                        # Evaluation should respect the same generation cap semantics.
+                        'max_tokens': min(args.num_tokens_to_generate, args.seq_length),
                         'top_p': args.rl_default_top_p,
                         'top_k': args.rl_default_top_k,
                     },

@@ -1,8 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
 import socket
-from typing import AsyncGenerator
 
 import httpx
 import yaml
@@ -38,6 +38,28 @@ from ...server.api import (
 from .. import agent
 from ..api import EnvironmentServer, InferenceServer, RemoteEvaluationRequest, RemoteRolloutRequest
 
+logger = logging.getLogger(__name__)
+
+
+def _ensure_inference_server_registrations():
+    # Import modules for side effects so TypeLookupable registries are populated
+    # before request.inference_interface.unwrap() is called.
+    from ...inference import megatron as _megatron_inference  # noqa: F401
+    from ..inference import inference_interface_server as _inference_server  # noqa: F401
+
+
+def _maybe_unwrap_inference_interface(request):
+    _ensure_inference_server_registrations()
+    try:
+        request.inference_interface = request.inference_interface.unwrap()
+    except KeyError as exc:
+        logger.warning(
+            "Inference interface type '%s' is not registered on env server; "
+            "passing through serialized model without unwrap (%s).",
+            getattr(request.inference_interface, "type_name", "unknown"),
+            exc,
+        )
+
 
 @EnvironmentServer.register_subclass
 class FastAPIEnvServer(EnvironmentServer):
@@ -49,6 +71,7 @@ class FastAPIEnvServer(EnvironmentServer):
     async def launch(cls, env_cls: type[Agent], cls_args: dict, port: int, **kwargs) -> Self:
 
         app = FastAPI()
+        env = env_cls(**cls_args)
 
         if issubclass(env_cls, GroupedRolloutGenerator):
 
@@ -56,9 +79,15 @@ class FastAPIEnvServer(EnvironmentServer):
             async def grouped_rollouts(
                 request: RemoteGroupedRolloutRequest,
             ) -> list[list[TokenRollout]]:
-                env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                _maybe_unwrap_inference_interface(request)
                 return await env.get_grouped_rollouts(request)
+
+            @app.post("/group_rollout/")
+            async def group_rollout(
+                request: RemoteGroupedRolloutRequest,
+            ) -> list[TokenRollout]:
+                _maybe_unwrap_inference_interface(request)
+                return await env.group_rollout(request)
 
         if issubclass(env_cls, ContrastiveRolloutGenerator):
 
@@ -66,24 +95,21 @@ class FastAPIEnvServer(EnvironmentServer):
             async def contrastive_rollouts(
                 request: RemoteRolloutRequest,
             ) -> list[ContrastiveRollout]:
-                env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                _maybe_unwrap_inference_interface(request)
                 return await env.get_contrastive_rollouts(request)
 
         if issubclass(env_cls, RolloutGenerator):
 
             @app.post("/rollouts/")
             async def rollouts(request: RemoteRolloutRequest) -> list[TokenRollout]:
-                env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                _maybe_unwrap_inference_interface(request)
                 return await env.get_reward_rollouts(request)
 
         if issubclass(env_cls, EvaluationAgent):
 
             @app.post("/evaluation/")
             async def run_evaluation(request: RemoteEvaluationRequest):
-                env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
+                _maybe_unwrap_inference_interface(request)
                 return await env.run_evaluation(request)
 
         loop = asyncio.get_event_loop()
@@ -117,13 +143,6 @@ class FastAPIEnvServer(EnvironmentServer):
         return rollouts
 
     async def group_rollout(self, request: GroupedRolloutRequest):
-        assert (
-            False
-        ), "Calling group_rollout on FastAPIEnvServer is not supported, use get_grouped_rollouts"
-
-    async def get_grouped_rollouts(
-        self, request: GroupedRolloutRequest
-    ) -> AsyncGenerator[list[TokenRollout], None]:
         assert isinstance(
             request.inference_interface, InferenceServer
         ), "Rollout requests to remote server must contain an InferenceServer object"
@@ -132,11 +151,10 @@ class FastAPIEnvServer(EnvironmentServer):
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"http://{self.env_server_host_port}/grouped_rollouts/", json=payload, timeout=None
+                f"http://{self.env_server_host_port}/group_rollout/", json=payload, timeout=None
             )
-        rollouts = [[TokenRollout.model_validate(r) for r in group] for group in response.json()]
-        for rollout in rollouts:
-            yield rollout
+        response.raise_for_status()
+        return [TokenRollout.model_validate(r) for r in response.json()]
 
     async def rollout(self, request: RolloutRequest) -> TokenRollout:
         assert (

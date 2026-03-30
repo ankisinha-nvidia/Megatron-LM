@@ -40,8 +40,13 @@ class WeightedMultiTask(
 ):
     """An agent that manages multiple sub-agents and distributes rollouts according to weights."""
 
-    def __init__(self, agent_configs: list[AgentConfig]):
-        super().__init__()
+    def __init__(
+        self,
+        agent_configs: list[AgentConfig],
+        *,
+        parallel_generation_tasks: int | None = None,
+    ):
+        super().__init__(parallel_generation_tasks=parallel_generation_tasks)
         if not agent_configs:
             raise ValueError("Must provide at least one agent configuration")
 
@@ -98,10 +103,7 @@ class WeightedMultiTask(
                 )
             )
 
-        instance = cls(agent_configs)
-        if parallel_generation_tasks is not None:
-            instance.parallel_generation_tasks = parallel_generation_tasks
-        return instance
+        return cls(agent_configs, parallel_generation_tasks=parallel_generation_tasks)
 
     def _distribute_counts(self, total_count: int, distribute_remainder: bool = True) -> list[int]:
         """Helper method to distribute counts according to weights.
@@ -185,15 +187,20 @@ class WeightedMultiTask(
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        agent_groups = self._distribute_counts(request.num_groups)
-        agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
+        if request.num_groups > 0:
+            agent_groups = self._distribute_counts(request.num_groups)
+            parallel_generation_tasks = min(self.parallel_generation_tasks, request.num_groups)
+        else:
+            agent_groups = [-1 if not agent.evaluation_only else 0 for agent in self.agent_configs]
+            parallel_generation_tasks = self.parallel_generation_tasks
+        agent_pgts = self._distribute_counts(parallel_generation_tasks)
+        agent_slots = self._distribute_counts(parallel_generation_tasks, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
         # Create tasks for each agent with non-zero groups
         generators = []
         for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
-            if num_groups > 0:
+            if num_groups != 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
                         f"Agent of type {type(agent)} does not support grouped rollouts"

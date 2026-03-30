@@ -6,7 +6,7 @@ import logging
 import httpx
 import torch.distributed as dist
 from openai import AsyncOpenAI, DefaultAioHttpClient
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 
 try:
     import h2  # noqa: F401
@@ -33,9 +33,11 @@ from ..server.api import InferenceServer
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+@InferenceServer.register_subclass
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
 
+    type_name: str = Field(default='MegatronLocal', frozen=True)
     host: str
     port: int
     context_window: int | None = None
@@ -113,7 +115,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 tokenizer=inference_engine.controller.tokenizer,
                 rank=dist.get_rank(),
                 server_port=kwargs.get('port', 8294),
-                parsers=[],
+                parsers=["deepseek-r1-reasoning", "qwen3-coder-tool"],
                 verbose=kwargs.get('verbose', False),
             )
         else:
