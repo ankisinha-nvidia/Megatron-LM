@@ -4,6 +4,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable
+import logging
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -18,6 +19,8 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -226,6 +229,17 @@ class GroupedRolloutGenerator(Agent, ABC):
             maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
+        yielded_groups = 0
+        filtered_groups_dropped = 0
+
+        logger.info(
+            "[mrl-grouped-rollouts] start num_groups=%s rollouts_per_group=%s parallel_generation_tasks=%s buffer_size=%s streaming=%s",
+            request.num_groups,
+            request.rollouts_per_group,
+            self.parallel_generation_tasks,
+            self.buffer_size if request.num_groups < 0 else 0,
+            request.num_groups < 0,
+        )
 
         # num_groups controls how many groups each worker generates and yields together.
         # When it's 1, the semaphore is a no-op.
@@ -259,7 +273,7 @@ class GroupedRolloutGenerator(Agent, ABC):
 
         @trace_async_exceptions(verbose=True)
         async def generate_task():
-            nonlocal submitted_groups
+            nonlocal submitted_groups, filtered_groups_dropped
             while request.streaming or submitted_groups < self.parallel_generation_tasks:
                 await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
@@ -272,6 +286,7 @@ class GroupedRolloutGenerator(Agent, ABC):
                 else:
                     if not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= groups_per_worker
+                        filtered_groups_dropped += 1
                         submission_gate.release()
 
         tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
@@ -300,16 +315,25 @@ class GroupedRolloutGenerator(Agent, ABC):
                         batch.sort(key=lambda g: g.index_in_batch)
                         next_batch_id += 1
                         for g in batch:
+                            yielded_groups += 1
                             yield g
                         submission_gate.release()
                 else:
                     # Yield groups as soon as they're completed.
+                    yielded_groups += 1
                     yield group
                     submission_gate.release()
         finally:
             shutdown_task.cancel()
             for task in tasks:
                 task.cancel()
+            logger.info(
+                "[mrl-grouped-rollouts] end submitted_groups=%s yielded_groups=%s filtered_groups_dropped=%s final_qsize=%s",
+                submitted_groups,
+                yielded_groups,
+                filtered_groups_dropped,
+                grouped_rollouts.qsize(),
+            )
 
 
 class EvaluationAgent(Agent, ABC):

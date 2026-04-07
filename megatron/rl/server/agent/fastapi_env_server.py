@@ -40,6 +40,8 @@ from ..api import EnvironmentServer, InferenceServer, RemoteEvaluationRequest, R
 
 logger = logging.getLogger(__name__)
 
+GROUP_ROLLOUT_MAX_RETRIES = 3
+
 
 def _ensure_inference_server_registrations():
     # Import modules for side effects so TypeLookupable registries are populated
@@ -149,12 +151,25 @@ class FastAPIEnvServer(EnvironmentServer):
         assert not request.streaming, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"http://{self.env_server_host_port}/group_rollout/", json=payload, timeout=None
-            )
-        response.raise_for_status()
-        return [TokenRollout.model_validate(r) for r in response.json()]
+        for attempt in range(1, GROUP_ROLLOUT_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"http://{self.env_server_host_port}/group_rollout/", json=payload, timeout=None
+                    )
+                response.raise_for_status()
+                return [TokenRollout.model_validate(r) for r in response.json()]
+            except httpx.RequestError as exc:
+                if attempt == GROUP_ROLLOUT_MAX_RETRIES:
+                    raise
+                logger.warning(
+                    "Transient group_rollout request failure to %s (attempt %s/%s): %s",
+                    self.env_server_host_port,
+                    attempt,
+                    GROUP_ROLLOUT_MAX_RETRIES,
+                    exc,
+                )
+                await asyncio.sleep(attempt)
 
     async def rollout(self, request: RolloutRequest) -> TokenRollout:
         assert (

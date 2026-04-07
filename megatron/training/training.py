@@ -3124,6 +3124,34 @@ def train(
         )
         is_first_iteration = False
 
+        checkpoint_decision_done = False
+        checkpoint_due_before_eval = (
+            (args.save and args.save_interval and iteration % args.save_interval == 0)
+            or (
+                args.save
+                and args.non_persistent_save_interval
+                and iteration % args.non_persistent_save_interval == 0
+            )
+            or (args.exit_interval and iteration % args.exit_interval == 0)
+            or (
+                args.phase_transition_iterations
+                and iteration in args.phase_transition_iterations
+            )
+        )
+        if checkpoint_due_before_eval:
+            should_exit = checkpoint_and_decide_exit(
+                model,
+                optimizer,
+                opt_param_scheduler,
+                iteration,
+                num_floating_point_operations_so_far,
+                checkpointing_context,
+                train_data_iterator,
+            )
+            checkpoint_decision_done = True
+            if should_exit:
+                break
+
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid:
             if args.log_energy:
@@ -3196,15 +3224,16 @@ def train(
         )
 
         # Checkpoint and decide whether to exit.
-        should_exit = checkpoint_and_decide_exit(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            iteration,
-            num_floating_point_operations_so_far,
-            checkpointing_context,
-            train_data_iterator,
-        )
+        if not checkpoint_decision_done:
+            should_exit = checkpoint_and_decide_exit(
+                model,
+                optimizer,
+                opt_param_scheduler,
+                iteration,
+                num_floating_point_operations_so_far,
+                checkpointing_context,
+                train_data_iterator,
+            )
         if should_exit:
             break
 
