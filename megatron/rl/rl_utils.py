@@ -984,83 +984,66 @@ def prep_wandb_metrics(
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
-
-    group_table = wandb_writer.Table(
-        columns=['group_means', 'group_stds'],
-        data=[[np.mean(g), np.std(g)] for g in rewards],
-    )
+    del wandb_writer, example_group, tokenizer
 
     true_policy_staleness = compute_true_staleness(
         policy_staleness, completed_at_steps, turn_lens, current_iteration)
     true_kv_staleness = compute_true_staleness(
         kv_cache_staleness, completed_at_steps, turn_lens, current_iteration)
 
+    group_means = [np.mean(g) for g in rewards]
+    group_stds = [np.std(g) for g in rewards]
+    flat_rewards = [r for g in rewards for r in g]
+    flat_traj_lens = [l for g in traj_lens for l in g]
+    flat_turn_lens = [l for g in turn_lens for l in g]
+    flat_num_turns = [n for g in num_turns for n in g]
+    flat_num_evictions = [e for g in num_evictions for e in g]
+
+    def _safe_mean(values):
+        return float(np.mean(values)) if values else 0.0
+
+    def _safe_min(values):
+        return float(min(values)) if values else 0.0
+
+    def _safe_max(values):
+        return float(max(values)) if values else 0.0
+
     metrics = {
-            'group_means_hist': wandb_writer.plot.histogram(
-                group_table, 'group_means', 'Group Means'
+            'group_mean_mean': _safe_mean(group_means),
+            'group_mean_min': _safe_min(group_means),
+            'group_mean_max': _safe_max(group_means),
+            'group_std_mean': _safe_mean(group_stds),
+            'group_std_min': _safe_min(group_stds),
+            'group_std_max': _safe_max(group_stds),
+            'mean_turn_length': _safe_mean(flat_turn_lens),
+            'mean_turn_length_std': _safe_mean([np.std(g) for g in turn_lens]),
+            'max_turn_length': _safe_max(flat_turn_lens),
+            'min_turn_length': _safe_min(flat_turn_lens),
+            'mean_traj_length': _safe_mean(flat_traj_lens),
+            'mean_traj_length_std': _safe_mean([np.std(g) for g in traj_lens]),
+            'max_traj_length': _safe_max(flat_traj_lens),
+            'min_traj_length': _safe_min(flat_traj_lens),
+            'mean_num_turns': _safe_mean(flat_num_turns),
+            'max_num_turns': _safe_max(flat_num_turns),
+            'min_num_turns': _safe_min(flat_num_turns),
+            'mean_reward': _safe_mean(group_means),
+            'reward_mean_all_samples': _safe_mean(flat_rewards),
+            'reward_min_all_samples': _safe_min(flat_rewards),
+            'reward_max_all_samples': _safe_max(flat_rewards),
+            'mean_advantage': _safe_mean(advantages),
+            'nonzero_groups_ratio': (
+                float(np.count_nonzero(advantages)) / len(advantages) if advantages else 0.0
             ),
-            'group_stds_hist': wandb_writer.plot.histogram(
-                group_table, 'group_stds', 'Group STDs'
-            ),
-            'rewards_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['reward'], data=[[r] for g in rewards for r in g]
-                ),
-                'reward', 'All Rewards'
-            ),
-            'advantages_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['advantages'], data=[[x] for x in advantages]
-                ),
-                'advantages', 'Advantages'
-            ),
-            'rollout_table': wandb_writer.Table(
-                columns=['reward', 'traj_length', 'num_evictions'],
-                data=list(zip(
-                    [r for g in rewards for r in g],
-                    [l for g in traj_lens for l in g],
-                    [e for g in num_evictions for e in g],
-                )),
-            ),
-            'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
-            'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
-            'max_turn_length': max([max(g) for g in turn_lens]),
-            'min_turn_length': min([min(g) for g in turn_lens]),
-            'mean_traj_length': np.mean([np.mean(g) for g in traj_lens]),
-            'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens]),
-            'max_traj_length': max([max(g) for g in traj_lens]),
-            'min_traj_length': min([min(g) for g in traj_lens]),
-            'mean_num_turns': np.mean([np.mean(g) for g in num_turns]),
-            'max_num_turns': max([max(g) for g in num_turns]),
-            'min_num_turns': min([min(g) for g in num_turns]),
-            'mean_reward': np.mean([np.mean(g) for g in rewards]),
-            'mean_advantage': np.mean(advantages),
-            'nonzero_groups_ratio': np.count_nonzero(advantages)
-            / len(advantages),
-            'mean_policy_staleness': np.mean(true_policy_staleness),
-            'max_policy_staleness': max(true_policy_staleness),
-            'min_policy_staleness': min(true_policy_staleness),
-            'mean_kv_cache_staleness': np.mean(true_kv_staleness),
-            'max_kv_cache_staleness': max(true_kv_staleness),
-            'min_kv_cache_staleness': min(true_kv_staleness),
-            'total_eviction_count': sum([sum(g) for g in num_evictions]),
-            'max_num_evictions': max([max(g) for g in num_evictions]),
-            'mean_completion_gap': np.mean([current_iteration - s for g in completed_at_steps for s in g]),
+            'mean_policy_staleness': _safe_mean(true_policy_staleness),
+            'max_policy_staleness': _safe_max(true_policy_staleness),
+            'min_policy_staleness': _safe_min(true_policy_staleness),
+            'mean_kv_cache_staleness': _safe_mean(true_kv_staleness),
+            'max_kv_cache_staleness': _safe_max(true_kv_staleness),
+            'min_kv_cache_staleness': _safe_min(true_kv_staleness),
+            'total_eviction_count': float(sum(flat_num_evictions)) if flat_num_evictions else 0.0,
+            'max_num_evictions': _safe_max(flat_num_evictions),
+            'mean_completion_gap': _safe_mean([current_iteration - s for g in completed_at_steps for s in g]),
     }
-    if example_group:
-        if tokenizer is None:
-            raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
-        metrics['rollouts'] = wandb_writer.Table(
-            columns=['Trajectories', 'Tokens', 'Rewards'],
-            rows=[
-                [
-                    tokenizer.detokenize(turn) if isinstance(r, TokenRollout) else turn,
-                    r.trajectory,
-                    r.reward,
-                ]
-                for r in example_group for turn in r.trajectory
-            ],
-        )
     return metrics
 
 

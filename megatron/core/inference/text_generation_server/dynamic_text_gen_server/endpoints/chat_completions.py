@@ -231,10 +231,18 @@ try:
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
-            if (
-                hasattr(tokenizer, 'apply_chat_template')
-                and getattr(tokenizer, "chat_template", None) is not None
-            ):
+            has_apply_chat_template = hasattr(tokenizer, 'apply_chat_template')
+            chat_template = getattr(tokenizer, "chat_template", None)
+            has_chat_template = chat_template is not None
+            logger.warning(
+                "[chat_completions] tokenizer=%s library=%s chat_template=%s tools=%s enable_thinking=%s",
+                type(tokenizer).__name__,
+                getattr(tokenizer, "library", None),
+                "present" if has_chat_template else "missing",
+                tools_requested,
+                chat_template_kwargs.get("enable_thinking"),
+            )
+            if has_apply_chat_template and has_chat_template:
                 prompt_tokens = tokenizer.apply_chat_template(
                     template_messages,
                     tokenize=True,
@@ -294,10 +302,19 @@ try:
                             retokenized_previous_turn_token_ids,
                             prompt_tokens,
                         )
+                logger.warning(
+                    "[chat_completions] using apply_chat_template prompt_messages=%d prompt_tokens=%d",
+                    len(template_messages),
+                    len(prompt_tokens),
+                )
 
             else:
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
+                )
+                logger.warning(
+                    "[chat_completions] using raw tokenize fallback prompt_messages=%d",
+                    len(messages),
                 )
                 prompt_tokens = tokenizer.tokenize(
                     "\n".join([message["content"] for message in messages])

@@ -3,6 +3,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable
+import logging
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -16,6 +17,8 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -201,29 +204,109 @@ class GroupedRolloutGenerator(Agent, ABC):
             maxsize=self.buffer_size if request.num_groups < 0 else 0
         )
         submitted_groups = 0
+        yielded_groups = 0
+        filtered_groups_dropped = 0
+
+        logger.info(
+            "[mrl-grouped-rollouts] start num_groups=%s rollouts_per_group=%s parallel_generation_tasks=%s buffer_size=%s streaming=%s",
+            request.num_groups,
+            request.rollouts_per_group,
+            self.parallel_generation_tasks,
+            self.buffer_size if request.num_groups < 0 else 0,
+            request.num_groups < 0,
+        )
 
         @trace_async_exceptions(verbose=True)
-        async def group_task():
-            nonlocal submitted_groups
+        async def group_task(task_idx: int):
+            nonlocal submitted_groups, filtered_groups_dropped
+            logger.info(
+                "[mrl-grouped-rollouts] producer_start task=%s submitted_groups=%s qsize=%s",
+                task_idx,
+                submitted_groups,
+                grouped_rollouts.qsize(),
+            )
             while request.num_groups == -1 or submitted_groups < request.num_groups:
                 submitted_groups += 1
+                current_group_idx = submitted_groups
+                logger.info(
+                    "[mrl-grouped-rollouts] producer_request task=%s group_index=%s qsize_before=%s",
+                    task_idx,
+                    current_group_idx,
+                    grouped_rollouts.qsize(),
+                )
                 group = await self.group_rollout(request=request)
+                logger.info(
+                    "[mrl-grouped-rollouts] producer_response task=%s group_index=%s rollout_count=%s qsize_before_put=%s",
+                    task_idx,
+                    current_group_idx,
+                    len(group),
+                    grouped_rollouts.qsize(),
+                )
                 if (
                     not request.filter_groups_with_same_reward
                     or np.std([r.reward for r in group]) > 1e-6
                 ):
                     await grouped_rollouts.put(group)
+                    logger.info(
+                        "[mrl-grouped-rollouts] producer_put task=%s group_index=%s qsize_after_put=%s",
+                        task_idx,
+                        current_group_idx,
+                        grouped_rollouts.qsize(),
+                    )
                 else:
                     submitted_groups -= 1
+                    filtered_groups_dropped += 1
+                    logger.info(
+                        "[mrl-grouped-rollouts] producer_filtered task=%s group_index=%s filtered_groups_dropped=%s qsize=%s",
+                        task_idx,
+                        current_group_idx,
+                        filtered_groups_dropped,
+                        grouped_rollouts.qsize(),
+                    )
+            logger.info(
+                "[mrl-grouped-rollouts] producer_end task=%s submitted_groups=%s filtered_groups_dropped=%s qsize=%s",
+                task_idx,
+                submitted_groups,
+                filtered_groups_dropped,
+                grouped_rollouts.qsize(),
+            )
 
-        tasks = [asyncio.create_task(group_task()) for _ in range(self.parallel_generation_tasks)]
+        tasks = [asyncio.create_task(group_task(task_idx)) for task_idx in range(self.parallel_generation_tasks)]
 
         try:
             while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                yield await grouped_rollouts.get()
+                live_group_tasks = sum(1 for task in tasks if not task.done())
+                logger.info(
+                    "[mrl-grouped-rollouts] consumer_wait qsize=%s submitted_groups=%s yielded_groups=%s live_group_tasks=%s filtered_groups_dropped=%s",
+                    grouped_rollouts.qsize(),
+                    submitted_groups,
+                    yielded_groups,
+                    live_group_tasks,
+                    filtered_groups_dropped,
+                )
+                group = await grouped_rollouts.get()
+                yielded_groups += 1
+                live_group_tasks = sum(1 for task in tasks if not task.done())
+                logger.info(
+                    "[mrl-grouped-rollouts] consumer_yield qsize_after_get=%s submitted_groups=%s yielded_groups=%s live_group_tasks=%s filtered_groups_dropped=%s rollout_count=%s",
+                    grouped_rollouts.qsize(),
+                    submitted_groups,
+                    yielded_groups,
+                    live_group_tasks,
+                    filtered_groups_dropped,
+                    len(group),
+                )
+                yield group
         finally:
             for task in tasks:
                 task.cancel()
+            logger.info(
+                "[mrl-grouped-rollouts] end submitted_groups=%s yielded_groups=%s filtered_groups_dropped=%s final_qsize=%s",
+                submitted_groups,
+                yielded_groups,
+                filtered_groups_dropped,
+                grouped_rollouts.qsize(),
+            )
 
 
 class EvaluationAgent(Agent, ABC):

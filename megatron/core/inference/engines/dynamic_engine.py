@@ -994,7 +994,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 [num_tokens_this_step, num_layers, topk].
 
         Returns:
-            A list of active requests and completed requests as `DynamicInferenceRequest` objects
+            A tuple containing active request ids, finished request records, and
+            the number of tokens generated in this step.
         """
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
@@ -1019,6 +1020,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
         # empty lists for each request, so the zip produces the correct number of iterations
         accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+        generated_tokens_this_step = 0
 
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
@@ -1053,6 +1055,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            appended_token_count = 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1068,6 +1071,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
+                    appended_token_count = len(tokens)
+                    generated_tokens_this_step += appended_token_count
                     first_token_event = None
                     if self.track_generated_token_events:
                         for token in tokens:
@@ -1110,6 +1115,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
                     request
                 )
+                if num_stop_word_trim > 0 and appended_token_count > 0:
+                    generated_tokens_this_step -= min(num_stop_word_trim, appended_token_count)
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -1247,7 +1254,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
-        return active_request_ids, finished_request_records
+        return active_request_ids, finished_request_records, generated_tokens_this_step
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.
@@ -1600,7 +1607,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
+            (
+                active_request_ids,
+                finished_request_records,
+                generated_tokens_this_step,
+            ) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
@@ -1615,6 +1626,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
+            generated_tokens_this_step = 0
 
         # Failed requests.
         for failed_request_id in self.failed_request_ids:
@@ -1697,9 +1709,18 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
+            generated_tokens_per_second = (
+                generated_tokens_this_step / step_time if step_time > 0 else 0.0
+            )
+            active_generated_tokens_total = sum(
+                len(self.get_request(request_id).generated_tokens)
+                for request_id in active_request_ids
+                if request_id in self.requests
+            )
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
+                "tok: step %d, active %d, rate %.1f tok/s ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
@@ -1725,6 +1746,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
                     context_state["evicted_request_count"],
+                    generated_tokens_this_step,
+                    active_generated_tokens_total,
+                    generated_tokens_per_second,
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
