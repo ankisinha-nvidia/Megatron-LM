@@ -148,7 +148,9 @@ class FastAPIEnvServer(EnvironmentServer):
         assert isinstance(
             request.inference_interface, InferenceServer
         ), "Rollout requests to remote server must contain an InferenceServer object"
-        assert not request.streaming, "FastAPIEnvServer does not support group rollout streaming"
+        # Caller-managed partial rollouts use repeated single-group RPCs and are
+        # safe here, but the true indefinite streaming sentinel is not.
+        assert request.num_groups != -1, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         for attempt in range(1, GROUP_ROLLOUT_MAX_RETRIES + 1):

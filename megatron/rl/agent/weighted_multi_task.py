@@ -187,14 +187,19 @@ class WeightedMultiTask(
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        if request.num_groups > 0:
+        if request.streaming:
+            agent_groups = self._distribute_counts(request.num_groups)
+            parallel_generation_tasks = self.parallel_generation_tasks
+            agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
+        elif request.num_groups > 0:
             agent_groups = self._distribute_counts(request.num_groups)
             parallel_generation_tasks = min(self.parallel_generation_tasks, request.num_groups)
+            agent_slots = self._distribute_counts(parallel_generation_tasks, distribute_remainder=False)
         else:
             agent_groups = [-1 if not agent.evaluation_only else 0 for agent in self.agent_configs]
             parallel_generation_tasks = self.parallel_generation_tasks
+            agent_slots = self._distribute_counts(parallel_generation_tasks, distribute_remainder=False)
         agent_pgts = self._distribute_counts(parallel_generation_tasks)
-        agent_slots = self._distribute_counts(parallel_generation_tasks, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
         # Create tasks for each agent with non-zero groups

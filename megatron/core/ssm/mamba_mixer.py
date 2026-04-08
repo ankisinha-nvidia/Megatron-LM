@@ -540,7 +540,18 @@ class MambaMixer(MegatronModule):
                 y_decode, y_prefill, context.mamba_metadata.device_decode_prefill, output_tensor=y
             )
         elif y_decode is not None:
-            y = y_decode
+            if y_decode.shape[0] < token_count:
+                # Padded prefill slots can exist even when no real prefill output
+                # was produced. Pad decode output so the residual path sees the
+                # expected token_count-sized tensor.
+                y = torch.zeros(
+                    [token_count, 1, y_decode.shape[-1]],
+                    dtype=y_decode.dtype,
+                    device=y_decode.device,
+                )
+                y[: y_decode.shape[0]] = y_decode
+            else:
+                y = y_decode
         elif y_prefill is not None:
             y = y_prefill
         else:

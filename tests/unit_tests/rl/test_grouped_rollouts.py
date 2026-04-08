@@ -117,3 +117,42 @@ class TestGroupedRollouts:
             assert sub_req.num_groups in (1, 3)  # distributed proportionally by weight
             assert sub_req.enforce_order == request.enforce_order
             assert sub_req.streaming == request.streaming
+
+    @pytest.mark.asyncio
+    async def test_weighted_multi_task_preserves_partial_rollout_parallelism(self):
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+        mt.parallel_generation_tasks = 4
+
+        captured = []
+        agent = mt.agents[0]
+        original = agent.get_grouped_rollouts
+
+        async def spy(req, orig=original):
+            captured.append(req)
+            async for group in orig(req):
+                yield group
+
+        agent.get_grouped_rollouts = spy
+
+        request = GroupedRolloutRequest(
+            num_groups=1,
+            rollouts_per_group=1,
+            inference_interface=MagicMock(spec=ReturnsRaw),
+            streaming=True,
+            enforce_order=False,
+        )
+
+        groups = []
+        async for group in mt.get_grouped_rollouts(request):
+            groups.append(group)
+            if len(groups) >= 4:
+                break
+
+        assert len(groups) == 4
+        assert captured
+        assert captured[0].streaming is True
+        assert captured[0].num_groups == 1
+        assert agent.parallel_generation_tasks == 4
