@@ -2,7 +2,6 @@
 
 import gc
 import socket
-import time
 
 import copy
 from functools import partial
@@ -105,103 +104,6 @@ logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
-_GLOBAL_CONCURRENCY_TRACKER = None
-
-
-class GlobalConcurrencyTracker:
-    """Incrementally ingest Carpenter concurrency events and emit interval summaries."""
-
-    _KIND_TO_METRIC = {
-        "rollout": "rollouts",
-        "llm_call": "llm_calls",
-        "tool_call": "tool_calls",
-    }
-
-    def __init__(self, event_root: str | os.PathLike[str]):
-        self.event_root = Path(event_root)
-        self.offsets: dict[Path, int] = {}
-        self.current = {name: 0 for name in self._KIND_TO_METRIC.values()}
-        now_ms = int(time.time() * 1000)
-        self.last_event_ts_ms = now_ms
-        self.interval_start_ts_ms = now_ms
-        self.interval_area = {name: 0.0 for name in self._KIND_TO_METRIC.values()}
-        self.interval_max = {name: 0 for name in self._KIND_TO_METRIC.values()}
-
-    def _accumulate_until(self, ts_ms: int) -> None:
-        ts_ms = max(int(ts_ms), self.last_event_ts_ms)
-        dt_ms = ts_ms - self.last_event_ts_ms
-        if dt_ms > 0:
-            for name, value in self.current.items():
-                self.interval_area[name] += float(value) * float(dt_ms)
-        self.last_event_ts_ms = ts_ms
-
-    def _apply_event(self, payload: dict[str, Any]) -> None:
-        kind = payload.get("kind")
-        metric_name = self._KIND_TO_METRIC.get(kind)
-        if metric_name is None:
-            return
-        ts_ms = int(payload.get("ts_ms", self.last_event_ts_ms) or self.last_event_ts_ms)
-        self._accumulate_until(ts_ms)
-        delta = int(payload.get("delta", 0) or 0)
-        self.current[metric_name] = max(0, self.current[metric_name] + delta)
-        self.interval_max[metric_name] = max(
-            self.interval_max[metric_name],
-            self.current[metric_name],
-        )
-
-    def ingest_new_events(self) -> None:
-        if not self.event_root.exists():
-            return
-        events: list[dict[str, Any]] = []
-        for path in sorted(self.event_root.glob("*.jsonl")):
-            start_offset = self.offsets.get(path, 0)
-            try:
-                with open(path, "r", encoding="utf-8") as fp:
-                    fp.seek(start_offset)
-                    for line in fp:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            events.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-                    self.offsets[path] = fp.tell()
-            except OSError:
-                continue
-        events.sort(key=lambda e: int(e.get("ts_ms", self.last_event_ts_ms) or self.last_event_ts_ms))
-        for payload in events:
-            self._apply_event(payload)
-
-    def flush_interval_metrics(self, *, now_ms: int | None = None) -> dict[str, float]:
-        now_ms = int(now_ms or time.time() * 1000)
-        self.ingest_new_events()
-        self._accumulate_until(now_ms)
-        interval_duration_ms = max(1, now_ms - self.interval_start_ts_ms)
-        metrics = {}
-        for metric_name in self._KIND_TO_METRIC.values():
-            metrics[f"mean_global_active_{metric_name}"] = (
-                self.interval_area[metric_name] / float(interval_duration_ms)
-            )
-            metrics[f"max_global_active_{metric_name}"] = float(self.interval_max[metric_name])
-        self.interval_start_ts_ms = now_ms
-        self.last_event_ts_ms = now_ms
-        self.interval_area = {name: 0.0 for name in self._KIND_TO_METRIC.values()}
-        self.interval_max = {name: self.current[name] for name in self._KIND_TO_METRIC.values()}
-        return metrics
-
-
-def get_global_concurrency_tracker() -> GlobalConcurrencyTracker | None:
-    global _GLOBAL_CONCURRENCY_TRACKER
-    if _GLOBAL_CONCURRENCY_TRACKER is not None:
-        return _GLOBAL_CONCURRENCY_TRACKER
-
-    event_root = os.getenv("CARPENTER_GLOBAL_CONCURRENCY_EVENT_ROOT", "").strip()
-    if not event_root:
-        return None
-
-    _GLOBAL_CONCURRENCY_TRACKER = GlobalConcurrencyTracker(event_root)
-    return _GLOBAL_CONCURRENCY_TRACKER
 
 
 # Track whether the inference model is currently paused (offloaded to CPU).
@@ -1473,9 +1375,6 @@ def maybe_log_training_metrics(
         rollout_peak_active_llm_calls_in_batch=rollout_peak_active_llm_calls_in_batch,
         rollout_peak_active_tool_calls_in_batch=rollout_peak_active_tool_calls_in_batch,
         current_iteration=current_iteration)
-    global_concurrency_tracker = get_global_concurrency_tracker()
-    if global_concurrency_tracker is not None:
-        metrics = metrics | global_concurrency_tracker.flush_interval_metrics()
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
