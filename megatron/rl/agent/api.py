@@ -72,6 +72,21 @@ class TokenRollout(AgentBaseModel):
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]
+    rollout_turn_count: int | None = None
+    rollout_token_count: int | None = None
+    rollout_wall_ms: int | None = None
+    rollout_error_type: str | None = None
+    rollout_started_at_ms: int | None = None
+    rollout_finished_at_ms: int | None = None
+    rollout_runtime_run_ms: int | None = None
+    rollout_time_to_first_post_ms: int | None = None
+    rollout_inference_ms: int | None = None
+    rollout_tool_wall_ms: int | None = None
+    rollout_llm_call_count: int | None = None
+    rollout_tool_call_count: int | None = None
+    rollout_peak_active_rollouts_in_batch: int | None = None
+    rollout_peak_active_llm_calls_in_batch: int | None = None
+    rollout_peak_active_tool_calls_in_batch: int | None = None
 
 
 Rollouts = list[TokenRollout | Rollout]

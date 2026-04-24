@@ -2,6 +2,7 @@
 
 import gc
 import socket
+import time
 
 import copy
 from functools import partial
@@ -104,6 +105,103 @@ logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
+_GLOBAL_CONCURRENCY_TRACKER = None
+
+
+class GlobalConcurrencyTracker:
+    """Incrementally ingest Carpenter concurrency events and emit interval summaries."""
+
+    _KIND_TO_METRIC = {
+        "rollout": "rollouts",
+        "llm_call": "llm_calls",
+        "tool_call": "tool_calls",
+    }
+
+    def __init__(self, event_root: str | os.PathLike[str]):
+        self.event_root = Path(event_root)
+        self.offsets: dict[Path, int] = {}
+        self.current = {name: 0 for name in self._KIND_TO_METRIC.values()}
+        now_ms = int(time.time() * 1000)
+        self.last_event_ts_ms = now_ms
+        self.interval_start_ts_ms = now_ms
+        self.interval_area = {name: 0.0 for name in self._KIND_TO_METRIC.values()}
+        self.interval_max = {name: 0 for name in self._KIND_TO_METRIC.values()}
+
+    def _accumulate_until(self, ts_ms: int) -> None:
+        ts_ms = max(int(ts_ms), self.last_event_ts_ms)
+        dt_ms = ts_ms - self.last_event_ts_ms
+        if dt_ms > 0:
+            for name, value in self.current.items():
+                self.interval_area[name] += float(value) * float(dt_ms)
+        self.last_event_ts_ms = ts_ms
+
+    def _apply_event(self, payload: dict[str, Any]) -> None:
+        kind = payload.get("kind")
+        metric_name = self._KIND_TO_METRIC.get(kind)
+        if metric_name is None:
+            return
+        ts_ms = int(payload.get("ts_ms", self.last_event_ts_ms) or self.last_event_ts_ms)
+        self._accumulate_until(ts_ms)
+        delta = int(payload.get("delta", 0) or 0)
+        self.current[metric_name] = max(0, self.current[metric_name] + delta)
+        self.interval_max[metric_name] = max(
+            self.interval_max[metric_name],
+            self.current[metric_name],
+        )
+
+    def ingest_new_events(self) -> None:
+        if not self.event_root.exists():
+            return
+        events: list[dict[str, Any]] = []
+        for path in sorted(self.event_root.glob("*.jsonl")):
+            start_offset = self.offsets.get(path, 0)
+            try:
+                with open(path, "r", encoding="utf-8") as fp:
+                    fp.seek(start_offset)
+                    for line in fp:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            events.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+                    self.offsets[path] = fp.tell()
+            except OSError:
+                continue
+        events.sort(key=lambda e: int(e.get("ts_ms", self.last_event_ts_ms) or self.last_event_ts_ms))
+        for payload in events:
+            self._apply_event(payload)
+
+    def flush_interval_metrics(self, *, now_ms: int | None = None) -> dict[str, float]:
+        now_ms = int(now_ms or time.time() * 1000)
+        self.ingest_new_events()
+        self._accumulate_until(now_ms)
+        interval_duration_ms = max(1, now_ms - self.interval_start_ts_ms)
+        metrics = {}
+        for metric_name in self._KIND_TO_METRIC.values():
+            metrics[f"mean_global_active_{metric_name}"] = (
+                self.interval_area[metric_name] / float(interval_duration_ms)
+            )
+            metrics[f"max_global_active_{metric_name}"] = float(self.interval_max[metric_name])
+        self.interval_start_ts_ms = now_ms
+        self.last_event_ts_ms = now_ms
+        self.interval_area = {name: 0.0 for name in self._KIND_TO_METRIC.values()}
+        self.interval_max = {name: self.current[name] for name in self._KIND_TO_METRIC.values()}
+        return metrics
+
+
+def get_global_concurrency_tracker() -> GlobalConcurrencyTracker | None:
+    global _GLOBAL_CONCURRENCY_TRACKER
+    if _GLOBAL_CONCURRENCY_TRACKER is not None:
+        return _GLOBAL_CONCURRENCY_TRACKER
+
+    event_root = os.getenv("CARPENTER_GLOBAL_CONCURRENCY_EVENT_ROOT", "").strip()
+    if not event_root:
+        return None
+
+    _GLOBAL_CONCURRENCY_TRACKER = GlobalConcurrencyTracker(event_root)
+    return _GLOBAL_CONCURRENCY_TRACKER
 
 
 # Track whether the inference model is currently paused (offloaded to CPU).
@@ -292,6 +390,23 @@ class RolloutStats:
     kv_cache_epoch: list[list[int]]
     completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
+    rollout_wall_ms: list[list[float]] | None = None
+    rollout_started_at_ms: list[list[float]] | None = None
+    rollout_finished_at_ms: list[list[float]] | None = None
+    rollout_inference_ms: list[list[float]] | None = None
+    rollout_tool_wall_ms: list[list[float]] | None = None
+    rollout_llm_call_count: list[list[float]] | None = None
+    rollout_tool_call_count: list[list[float]] | None = None
+    rollout_peak_active_rollouts_in_batch: list[list[float]] | None = None
+    rollout_peak_active_llm_calls_in_batch: list[list[float]] | None = None
+    rollout_peak_active_tool_calls_in_batch: list[list[float]] | None = None
+    rollout_llm_call_counts: None | list[list[int]] = None
+    rollout_tool_call_counts: None | list[list[int]] = None
+    rollout_token_counts: None | list[list[int]] = None
+    rollout_inference_ms_total: None | list[list[float]] = None
+    rollout_tool_ms_total: None | list[list[float]] = None
+    rollout_other_ms_total: None | list[list[float]] = None
+    rollout_error_types: None | list[list[str | None]] = None
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -473,8 +588,9 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             inference_interface=inference_interface,
             generation_args={
                 'temperature': args.rl_default_temperature,
-                # Cap generation by the configured new-token budget, not the full context window.
-                'max_tokens': min(args.num_tokens_to_generate, args.inference_max_seq_length),
+                # Request the desired generation budget; the inference server will
+                # clamp it per request based on the prompt length and context window.
+                'max_tokens': args.num_tokens_to_generate,
                 'top_p': args.rl_default_top_p,
                 'top_k': args.rl_default_top_k,
             },
@@ -849,19 +965,63 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
+    rollout_llm_call_counts = []
+    rollout_tool_call_counts = []
+    rollout_token_counts = []
+    rollout_wall_ms = []
+    rollout_runtime_run_ms = []
+    rollout_time_to_first_post_ms = []
+    rollout_inference_ms_total = []
+    rollout_tool_ms_total = []
+    rollout_other_ms_total = []
+    rollout_error_types = []
     all_policy_epoch = []
     all_kv_cache_epoch = []
     all_completed_epochs = []
     all_num_evictions = []
+    all_rollout_wall_ms = []
+    all_rollout_started_at_ms = []
+    all_rollout_finished_at_ms = []
+    all_rollout_runtime_run_ms = []
+    all_rollout_time_to_first_post_ms = []
+    all_rollout_inference_ms = []
+    all_rollout_tool_wall_ms = []
+    all_rollout_llm_call_count = []
+    all_rollout_tool_call_count = []
+    all_rollout_peak_active_rollouts_in_batch = []
+    all_rollout_peak_active_llm_calls_in_batch = []
+    all_rollout_peak_active_tool_calls_in_batch = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
+        group_rollout_llm_call_counts = []
+        group_rollout_tool_call_counts = []
+        group_rollout_token_counts = []
+        group_rollout_wall_ms = []
+        group_rollout_runtime_run_ms = []
+        group_rollout_time_to_first_post_ms = []
+        group_rollout_inference_ms_total = []
+        group_rollout_tool_ms_total = []
+        group_rollout_other_ms_total = []
+        group_rollout_error_types = []
         group_policy_epoch = []
         group_kv_epoch = []
         group_completed_epochs = []
         group_num_evictions = []
+        group_rollout_wall_ms = []
+        group_rollout_started_at_ms = []
+        group_rollout_finished_at_ms = []
+        group_rollout_runtime_run_ms = []
+        group_rollout_time_to_first_post_ms = []
+        group_rollout_inference_ms = []
+        group_rollout_tool_wall_ms = []
+        group_rollout_llm_call_count = []
+        group_rollout_tool_call_count = []
+        group_rollout_peak_active_rollouts_in_batch = []
+        group_rollout_peak_active_llm_calls_in_batch = []
+        group_rollout_peak_active_tool_calls_in_batch = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -877,9 +1037,70 @@ def compute_group_stats(
                 lang_rl_log(
                     f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} chars] {rollout.trajectory}"
                 )
-            group_num_turns.append(len(rollout.trajectory))
-            group_rewards.append(rollout.reward)
             roll_turn_lens = [len(t) for t in rollout.trajectory]
+            rollout_token_count = int(
+                getattr(rollout, "rollout_token_count", sum(roll_turn_lens)) or 0
+            )
+            rollout_wall_total = float(getattr(rollout, "rollout_wall_ms", 0.0) or 0.0)
+            rollout_runtime_total = float(getattr(rollout, "rollout_runtime_run_ms", 0.0) or 0.0)
+            rollout_time_to_first_post = float(
+                getattr(rollout, "rollout_time_to_first_post_ms", 0.0) or 0.0
+            )
+            rollout_inference_total = float(
+                getattr(
+                    rollout,
+                    "rollout_inference_ms_total",
+                    getattr(rollout, "rollout_inference_ms", 0.0),
+                )
+                or 0.0
+            )
+            rollout_tool_total = float(
+                getattr(
+                    rollout,
+                    "rollout_tool_ms_total",
+                    getattr(rollout, "rollout_tool_wall_ms", 0.0),
+                )
+                or 0.0
+            )
+            rollout_other_total = float(
+                getattr(
+                    rollout,
+                    "rollout_other_ms_total",
+                    max(rollout_wall_total - rollout_inference_total - rollout_tool_total, 0.0),
+                )
+                or 0.0
+            )
+
+            group_num_turns.append(len(rollout.trajectory))
+            group_rollout_llm_call_counts.append(
+                int(
+                    getattr(
+                        rollout,
+                        "rollout_llm_call_count",
+                        getattr(rollout, "rollout_llm_call_counts", 0),
+                    )
+                    or 0
+                )
+            )
+            group_rollout_tool_call_counts.append(
+                int(
+                    getattr(
+                        rollout,
+                        "rollout_tool_call_count",
+                        getattr(rollout, "rollout_tool_call_counts", 0),
+                    )
+                    or 0
+                )
+            )
+            group_rollout_token_counts.append(rollout_token_count)
+            group_rollout_wall_ms.append(rollout_wall_total)
+            group_rollout_runtime_run_ms.append(rollout_runtime_total)
+            group_rollout_time_to_first_post_ms.append(rollout_time_to_first_post)
+            group_rollout_inference_ms_total.append(rollout_inference_total)
+            group_rollout_tool_ms_total.append(rollout_tool_total)
+            group_rollout_other_ms_total.append(rollout_other_total)
+            group_rollout_error_types.append(getattr(rollout, "rollout_error_type", None))
+            group_rewards.append(rollout.reward)
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
@@ -888,10 +1109,55 @@ def compute_group_stats(
             group_kv_epoch.append(min(turn[0][1] for turn in rollout.kv_cache_epoch))
             group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
+            group_rollout_started_at_ms.append(float(getattr(rollout, "rollout_started_at_ms", 0.0) or 0.0))
+            group_rollout_finished_at_ms.append(float(getattr(rollout, "rollout_finished_at_ms", 0.0) or 0.0))
+            group_rollout_inference_ms.append(
+                float(getattr(rollout, "rollout_inference_ms", 0.0) or 0.0)
+            )
+            group_rollout_tool_wall_ms.append(
+                float(getattr(rollout, "rollout_tool_wall_ms", 0.0) or 0.0)
+            )
+            group_rollout_llm_call_count.append(
+                float(getattr(rollout, "rollout_llm_call_count", 0.0) or 0.0)
+            )
+            group_rollout_tool_call_count.append(
+                float(getattr(rollout, "rollout_tool_call_count", 0.0) or 0.0)
+            )
+            group_rollout_peak_active_rollouts_in_batch.append(
+                float(getattr(rollout, "rollout_peak_active_rollouts_in_batch", 0.0) or 0.0)
+            )
+            group_rollout_peak_active_llm_calls_in_batch.append(
+                float(getattr(rollout, "rollout_peak_active_llm_calls_in_batch", 0.0) or 0.0)
+            )
+            group_rollout_peak_active_tool_calls_in_batch.append(
+                float(getattr(rollout, "rollout_peak_active_tool_calls_in_batch", 0.0) or 0.0)
+            )
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
         all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
+        rollout_llm_call_counts.append(group_rollout_llm_call_counts)
+        rollout_tool_call_counts.append(group_rollout_tool_call_counts)
+        rollout_token_counts.append(group_rollout_token_counts)
+        rollout_wall_ms.append(group_rollout_wall_ms)
+        rollout_runtime_run_ms.append(group_rollout_runtime_run_ms)
+        rollout_time_to_first_post_ms.append(group_rollout_time_to_first_post_ms)
+        rollout_inference_ms_total.append(group_rollout_inference_ms_total)
+        rollout_tool_ms_total.append(group_rollout_tool_ms_total)
+        rollout_other_ms_total.append(group_rollout_other_ms_total)
+        rollout_error_types.append(group_rollout_error_types)
+        all_rollout_wall_ms.append(group_rollout_wall_ms)
+        all_rollout_started_at_ms.append(group_rollout_started_at_ms)
+        all_rollout_finished_at_ms.append(group_rollout_finished_at_ms)
+        all_rollout_runtime_run_ms.append(group_rollout_runtime_run_ms)
+        all_rollout_time_to_first_post_ms.append(group_rollout_time_to_first_post_ms)
+        all_rollout_inference_ms.append(group_rollout_inference_ms)
+        all_rollout_tool_wall_ms.append(group_rollout_tool_wall_ms)
+        all_rollout_llm_call_count.append(group_rollout_llm_call_count)
+        all_rollout_tool_call_count.append(group_rollout_tool_call_count)
+        all_rollout_peak_active_rollouts_in_batch.append(group_rollout_peak_active_rollouts_in_batch)
+        all_rollout_peak_active_llm_calls_in_batch.append(group_rollout_peak_active_llm_calls_in_batch)
+        all_rollout_peak_active_tool_calls_in_batch.append(group_rollout_peak_active_tool_calls_in_batch)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -909,6 +1175,13 @@ def compute_group_stats(
         # with the inner list being the group data.
         env_ids=env_ids,
         num_turns=num_turns,
+        rollout_llm_call_counts=rollout_llm_call_counts,
+        rollout_tool_call_counts=rollout_tool_call_counts,
+        rollout_token_counts=rollout_token_counts,
+        rollout_inference_ms_total=rollout_inference_ms_total,
+        rollout_tool_ms_total=rollout_tool_ms_total,
+        rollout_other_ms_total=rollout_other_ms_total,
+        rollout_error_types=rollout_error_types,
         advantages=calculate_grpo_advantages(rewards, num_turns),
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
@@ -923,6 +1196,18 @@ def compute_group_stats(
         kv_cache_epoch=all_kv_cache_epoch,
         completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
+        rollout_wall_ms=all_rollout_wall_ms,
+        rollout_started_at_ms=all_rollout_started_at_ms,
+        rollout_finished_at_ms=all_rollout_finished_at_ms,
+        rollout_runtime_run_ms=all_rollout_runtime_run_ms,
+        rollout_time_to_first_post_ms=all_rollout_time_to_first_post_ms,
+        rollout_inference_ms=all_rollout_inference_ms,
+        rollout_tool_wall_ms=all_rollout_tool_wall_ms,
+        rollout_llm_call_count=all_rollout_llm_call_count,
+        rollout_tool_call_count=all_rollout_tool_call_count,
+        rollout_peak_active_rollouts_in_batch=all_rollout_peak_active_rollouts_in_batch,
+        rollout_peak_active_llm_calls_in_batch=all_rollout_peak_active_llm_calls_in_batch,
+        rollout_peak_active_tool_calls_in_batch=all_rollout_peak_active_tool_calls_in_batch,
     )
     return stats
 
@@ -934,12 +1219,31 @@ def prep_wandb_metrics(
         turn_lens: List[List[int]],
         rewards: List[List[float]],
         num_turns: List[List[int]],
+        rollout_llm_call_counts: List[List[int]] | None,
+        rollout_tool_call_counts: List[List[int]] | None,
+        rollout_token_counts: List[List[int]] | None,
+        rollout_wall_ms: List[List[float]] | None,
+        rollout_runtime_run_ms: List[List[float]] | None,
+        rollout_time_to_first_post_ms: List[List[float]] | None,
+        rollout_inference_ms_total: List[List[float]] | None,
+        rollout_tool_ms_total: List[List[float]] | None,
+        rollout_other_ms_total: List[List[float]] | None,
+        rollout_error_types: List[List[str | None]] | None,
         advantages: List[float],
         policy_epoch: List[List[int]],
         kv_cache_epoch: List[List[int]],
         completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
         current_iteration: int,
+        rollout_started_at_ms: List[List[float]] | None = None,
+        rollout_finished_at_ms: List[List[float]] | None = None,
+        rollout_inference_ms: List[List[float]] | None = None,
+        rollout_tool_wall_ms: List[List[float]] | None = None,
+        rollout_llm_call_count: List[List[float]] | None = None,
+        rollout_tool_call_count: List[List[float]] | None = None,
+        rollout_peak_active_rollouts_in_batch: List[List[float]] | None = None,
+        rollout_peak_active_llm_calls_in_batch: List[List[float]] | None = None,
+        rollout_peak_active_tool_calls_in_batch: List[List[float]] | None = None,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
     ):
@@ -957,16 +1261,24 @@ def prep_wandb_metrics(
         kv_cache_epoch: Grouped list of per-rollout min KV cache epoch stamps.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
+        rollout_llm_call_counts: Grouped list of per-rollout LLM call counts.
+        rollout_tool_call_counts: Grouped list of per-rollout tool call counts.
+        rollout_token_counts: Grouped list of per-rollout token counts.
+        rollout_wall_ms: Grouped list of per-rollout wall times from the environment.
+        rollout_runtime_run_ms: Grouped list of per-rollout runtime durations from the environment.
+        rollout_time_to_first_post_ms: Grouped list of per-rollout latency to first post from the environment.
+        rollout_inference_ms_total: Grouped list of per-rollout LLM/inference time totals.
+        rollout_tool_ms_total: Grouped list of per-rollout tool-execution wall time totals.
+        rollout_other_ms_total: Grouped list of per-rollout residual/non-LLM non-tool time totals.
+        rollout_error_types: Grouped list of per-rollout error types.
+        rollout_peak_active_rollouts_in_batch: Grouped list of per-rollout peak active rollouts in batch.
+        rollout_peak_active_llm_calls_in_batch: Grouped list of per-rollout peak concurrent LLM calls in batch.
+        rollout_peak_active_tool_calls_in_batch: Grouped list of per-rollout peak concurrent tool calls in batch.
         current_iteration: Current training iteration.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
-    del wandb_writer, example_group, tokenizer
-
-    group_table = wandb_writer.Table(
-        columns=['group_means', 'group_stds'],
-        data=[[np.mean(g), np.std(g)] for g in rewards],
-    )
+    del example_group, tokenizer, wandb_writer
 
     true_policy_staleness = [current_iteration - s for g in policy_epoch for s in g]
     true_kv_staleness = [current_iteration - s for g in kv_cache_epoch for s in g]
@@ -977,7 +1289,21 @@ def prep_wandb_metrics(
     flat_traj_lens = [l for g in traj_lens for l in g]
     flat_turn_lens = [l for g in turn_lens for l in g]
     flat_num_turns = [n for g in num_turns for n in g]
+    flat_rollout_llm_call_counts = [n for g in (rollout_llm_call_counts or []) for n in g]
+    flat_rollout_tool_call_counts = [n for g in (rollout_tool_call_counts or []) for n in g]
+    flat_rollout_token_counts = [n for g in (rollout_token_counts or []) for n in g]
     flat_num_evictions = [e for g in num_evictions for e in g]
+    flat_rollout_wall_ms = [n for g in (rollout_wall_ms or []) for n in g]
+    flat_rollout_runtime_run_ms = [n for g in (rollout_runtime_run_ms or []) for n in g]
+    flat_rollout_time_to_first_post_ms = [n for g in (rollout_time_to_first_post_ms or []) for n in g]
+    flat_rollout_inference_ms_total = [n for g in (rollout_inference_ms_total or []) for n in g]
+    flat_rollout_tool_ms_total = [n for g in (rollout_tool_ms_total or []) for n in g]
+    flat_rollout_other_ms_total = [n for g in (rollout_other_ms_total or []) for n in g]
+    flat_rollout_error_types = [e for g in (rollout_error_types or []) for e in g]
+    flat_rollout_inference_ms = [n for g in (rollout_inference_ms or []) for n in g]
+    flat_rollout_tool_wall_ms = [n for g in (rollout_tool_wall_ms or []) for n in g]
+    flat_rollout_llm_call_count = [n for g in (rollout_llm_call_count or []) for n in g]
+    flat_rollout_tool_call_count = [n for g in (rollout_tool_call_count or []) for n in g]
 
     def _safe_mean(values):
         return float(np.mean(values)) if values else 0.0
@@ -988,69 +1314,72 @@ def prep_wandb_metrics(
     def _safe_max(values):
         return float(max(values)) if values else 0.0
 
+    successful_rollout_count = 0
+    timeout_rollout_error_count = 0
+    max_turns_exceeded_count = 0
+    other_rollout_error_count = 0
+    for error_type in flat_rollout_error_types:
+        normalized_error = (
+            str(error_type).strip().lower().replace(" ", "_").replace("-", "_")
+            if error_type
+            else ""
+        )
+        if not normalized_error:
+            successful_rollout_count += 1
+        elif normalized_error == "timeout":
+            timeout_rollout_error_count += 1
+        elif normalized_error == "max_turns_exceeded":
+            max_turns_exceeded_count += 1
+        else:
+            other_rollout_error_count += 1
+
     metrics = {
-            'group_means_hist': wandb_writer.plot.histogram(
-                group_table, 'group_means', 'Group Means'
-            ),
-            'group_stds_hist': wandb_writer.plot.histogram(
-                group_table, 'group_stds', 'Group STDs'
-            ),
-            'rewards_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['reward'], data=[[r] for g in rewards for r in g]
-                ),
-                'reward', 'All Rewards'
-            ),
-            'advantages_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['advantages'], data=[[x] for x in advantages]
-                ),
-                'advantages', 'Advantages'
-            ),
-            'rollout_table': wandb_writer.Table(
-                columns=['reward', 'traj_length', 'num_evictions'],
-                data=list(zip(
-                    [r for g in rewards for r in g],
-                    [l for g in traj_lens for l in g],
-                    [e for g in num_evictions for e in g],
-                )),
-            ),
-            'group_mean_mean': _safe_mean(group_means),
-            'group_mean_min': _safe_min(group_means),
-            'group_mean_max': _safe_max(group_means),
-            'group_std_mean': _safe_mean(group_stds),
-            'group_std_min': _safe_min(group_stds),
-            'group_std_max': _safe_max(group_stds),
-            'mean_turn_length': _safe_mean(flat_turn_lens),
-            'mean_turn_length_std': _safe_mean([np.std(g) for g in turn_lens]),
-            'max_turn_length': _safe_max(flat_turn_lens),
-            'min_turn_length': _safe_min(flat_turn_lens),
-            'mean_traj_length': _safe_mean(flat_traj_lens),
-            'mean_traj_length_std': _safe_mean([np.std(g) for g in traj_lens]),
-            'max_traj_length': _safe_max(flat_traj_lens),
-            'min_traj_length': _safe_min(flat_traj_lens),
-            'mean_num_turns': _safe_mean(flat_num_turns),
-            'max_num_turns': _safe_max(flat_num_turns),
-            'min_num_turns': _safe_min(flat_num_turns),
+            # Keep W&B logging scalar-only. Table/histogram artifacts trigger
+            # local staging copies and can exhaust filesystem quota on long RL runs.
+            # Reward / training health
             'mean_reward': _safe_mean(group_means),
-            'reward_mean_all_samples': _safe_mean(flat_rewards),
-            'reward_min_all_samples': _safe_min(flat_rewards),
-            'reward_max_all_samples': _safe_max(flat_rewards),
-            'mean_advantage': _safe_mean(advantages),
-            'nonzero_groups_ratio': (
-                float(np.count_nonzero(advantages)) / len(advantages) if advantages else 0.0
-            ),
+            'mean_reward_std': _safe_mean(group_stds),
+
+            # Rollout work volume
+            'mean_turn_count': _safe_mean(flat_num_turns),
+            'mean_turn_token_length': _safe_mean(flat_turn_lens),
+            'mean_traj_token_length': _safe_mean(flat_traj_lens),
+            'mean_rollout_llm_call_count': _safe_mean(flat_rollout_llm_call_counts),
+            'mean_rollout_tool_call_count': _safe_mean(flat_rollout_tool_call_counts),
+            'mean_rollout_token_count': _safe_mean(flat_rollout_token_counts),
+
+            # Rollout timing / tool vs LLM split
+            'mean_rollout_wall_ms': _safe_mean(flat_rollout_wall_ms),
+            'max_rollout_wall_ms': _safe_max(flat_rollout_wall_ms),
+            'mean_rollout_runtime_run_ms': _safe_mean(flat_rollout_runtime_run_ms),
+            'max_rollout_runtime_run_ms': _safe_max(flat_rollout_runtime_run_ms),
+            'mean_rollout_time_to_first_post_ms': _safe_mean(flat_rollout_time_to_first_post_ms),
+            'max_rollout_time_to_first_post_ms': _safe_max(flat_rollout_time_to_first_post_ms),
+            'mean_rollout_inference_ms_total': _safe_mean(flat_rollout_inference_ms_total),
+            'mean_rollout_tool_ms_total': _safe_mean(flat_rollout_tool_ms_total),
+            'mean_rollout_other_ms_total': _safe_mean(flat_rollout_other_ms_total),
+            'mean_rollout_inference_ms': _safe_mean(flat_rollout_inference_ms),
+            'max_rollout_inference_ms': _safe_max(flat_rollout_inference_ms),
+            'mean_rollout_tool_wall_ms': _safe_mean(flat_rollout_tool_wall_ms),
+            'max_rollout_tool_wall_ms': _safe_max(flat_rollout_tool_wall_ms),
+            'max_rollout_llm_call_count': _safe_max(flat_rollout_llm_call_count),
+            'max_rollout_tool_call_count': _safe_max(flat_rollout_tool_call_count),
+
+            # Async freshness
             'mean_policy_staleness': _safe_mean(true_policy_staleness),
             'max_policy_staleness': _safe_max(true_policy_staleness),
-            'min_policy_staleness': _safe_min(true_policy_staleness),
             'mean_kv_cache_staleness': _safe_mean(true_kv_staleness),
             'max_kv_cache_staleness': _safe_max(true_kv_staleness),
-            'min_kv_cache_staleness': _safe_min(true_kv_staleness),
-            'total_eviction_count': float(sum(flat_num_evictions)) if flat_num_evictions else 0.0,
-            'max_num_evictions': _safe_max(flat_num_evictions),
             'mean_completion_gap': _safe_mean(
                 [current_iteration - s for g in completed_epochs for s in g]
             ),
+
+            # Error / infra
+            'max_num_evictions': _safe_max(flat_num_evictions),
+            'successful_rollout_count': float(successful_rollout_count),
+            'timeout_rollout_error_count': float(timeout_rollout_error_count),
+            'max_turns_exceeded_count': float(max_turns_exceeded_count),
+            'other_rollout_error_count': float(other_rollout_error_count),
     }
     return metrics
 
@@ -1095,15 +1424,58 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
+    rollout_llm_call_counts = group_stats.rollout_llm_call_counts
+    rollout_tool_call_counts = group_stats.rollout_tool_call_counts
+    rollout_token_counts = group_stats.rollout_token_counts
+    rollout_wall_ms = group_stats.rollout_wall_ms
+    rollout_runtime_run_ms = group_stats.rollout_runtime_run_ms
+    rollout_time_to_first_post_ms = group_stats.rollout_time_to_first_post_ms
+    rollout_inference_ms_total = group_stats.rollout_inference_ms_total
+    rollout_tool_ms_total = group_stats.rollout_tool_ms_total
+    rollout_other_ms_total = group_stats.rollout_other_ms_total
+    rollout_error_types = group_stats.rollout_error_types
     policy_epoch = group_stats.policy_epoch
     kv_cache_epoch = group_stats.kv_cache_epoch
     completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
+    rollout_started_at_ms = group_stats.rollout_started_at_ms
+    rollout_finished_at_ms = group_stats.rollout_finished_at_ms
+    rollout_inference_ms = group_stats.rollout_inference_ms
+    rollout_tool_wall_ms = group_stats.rollout_tool_wall_ms
+    rollout_llm_call_count = group_stats.rollout_llm_call_count
+    rollout_tool_call_count = group_stats.rollout_tool_call_count
+    rollout_peak_active_rollouts_in_batch = group_stats.rollout_peak_active_rollouts_in_batch
+    rollout_peak_active_llm_calls_in_batch = group_stats.rollout_peak_active_llm_calls_in_batch
+    rollout_peak_active_tool_calls_in_batch = group_stats.rollout_peak_active_tool_calls_in_batch
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
-        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
+        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns,
+        rollout_llm_call_counts=rollout_llm_call_counts,
+        rollout_tool_call_counts=rollout_tool_call_counts,
+        rollout_token_counts=rollout_token_counts,
+        rollout_wall_ms=rollout_wall_ms,
+        rollout_runtime_run_ms=rollout_runtime_run_ms,
+        rollout_time_to_first_post_ms=rollout_time_to_first_post_ms,
+        rollout_inference_ms_total=rollout_inference_ms_total,
+        rollout_tool_ms_total=rollout_tool_ms_total,
+        rollout_other_ms_total=rollout_other_ms_total,
+        rollout_error_types=rollout_error_types,
+        advantages=advantages,
         policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
-        num_evictions=num_evictions, current_iteration=current_iteration)
+        num_evictions=num_evictions,
+        rollout_started_at_ms=rollout_started_at_ms,
+        rollout_finished_at_ms=rollout_finished_at_ms,
+        rollout_inference_ms=rollout_inference_ms,
+        rollout_tool_wall_ms=rollout_tool_wall_ms,
+        rollout_llm_call_count=rollout_llm_call_count,
+        rollout_tool_call_count=rollout_tool_call_count,
+        rollout_peak_active_rollouts_in_batch=rollout_peak_active_rollouts_in_batch,
+        rollout_peak_active_llm_calls_in_batch=rollout_peak_active_llm_calls_in_batch,
+        rollout_peak_active_tool_calls_in_batch=rollout_peak_active_tool_calls_in_batch,
+        current_iteration=current_iteration)
+    global_concurrency_tracker = get_global_concurrency_tracker()
+    if global_concurrency_tracker is not None:
+        metrics = metrics | global_concurrency_tracker.flush_interval_metrics()
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -1121,11 +1493,30 @@ def maybe_log_training_metrics(
             turn_lens=env_stats(turn_lens, env_idx),
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
+            rollout_llm_call_counts=env_stats(rollout_llm_call_counts, env_idx),
+            rollout_tool_call_counts=env_stats(rollout_tool_call_counts, env_idx),
+            rollout_token_counts=env_stats(rollout_token_counts, env_idx),
+            rollout_wall_ms=env_stats(rollout_wall_ms, env_idx),
+            rollout_runtime_run_ms=env_stats(rollout_runtime_run_ms, env_idx),
+            rollout_time_to_first_post_ms=env_stats(rollout_time_to_first_post_ms, env_idx),
+            rollout_inference_ms_total=env_stats(rollout_inference_ms_total, env_idx),
+            rollout_tool_ms_total=env_stats(rollout_tool_ms_total, env_idx),
+            rollout_other_ms_total=env_stats(rollout_other_ms_total, env_idx),
+            rollout_error_types=env_stats(rollout_error_types, env_idx),
             advantages=env_advantages,
             policy_epoch=env_stats(policy_epoch, env_idx),
             kv_cache_epoch=env_stats(kv_cache_epoch, env_idx),
             completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
+            rollout_started_at_ms=env_stats(rollout_started_at_ms, env_idx),
+            rollout_finished_at_ms=env_stats(rollout_finished_at_ms, env_idx),
+            rollout_inference_ms=env_stats(rollout_inference_ms, env_idx),
+            rollout_tool_wall_ms=env_stats(rollout_tool_wall_ms, env_idx),
+            rollout_llm_call_count=env_stats(rollout_llm_call_count, env_idx),
+            rollout_tool_call_count=env_stats(rollout_tool_call_count, env_idx),
+            rollout_peak_active_rollouts_in_batch=env_stats(rollout_peak_active_rollouts_in_batch, env_idx),
+            rollout_peak_active_llm_calls_in_batch=env_stats(rollout_peak_active_llm_calls_in_batch, env_idx),
+            rollout_peak_active_tool_calls_in_batch=env_stats(rollout_peak_active_tool_calls_in_batch, env_idx),
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
@@ -1694,7 +2085,6 @@ def get_grpo_data_iterator(
         iteration == runtime_state.last_collection_iteration +
         (grpo_iterations * global_batches_per_collection)
     ):
-
         rollouts = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
         )
@@ -1767,8 +2157,8 @@ def evaluate_and_print_results_rl(
                     rank_info=None,
                     generation_args={
                         'temperature': args.rl_default_temperature,
-                        # Evaluation should respect the same generation cap semantics.
-                        'max_tokens': min(args.num_tokens_to_generate, args.seq_length),
+                        # Apply the same prompt-aware cap semantics as training rollouts.
+                        'max_tokens': args.num_tokens_to_generate,
                         'top_p': args.rl_default_top_p,
                         'top_k': args.rl_default_top_k,
                     },

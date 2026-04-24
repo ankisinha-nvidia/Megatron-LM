@@ -645,7 +645,10 @@ class TorchDistSaveShardedStrategy:
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Each async strategy can be trivially used as a sync strategy."""
-        strategy = "nvrx" if HAVE_NVRX else "mcore"
+        # Prefer MCore for sync saves. Some containers ship a partially compatible
+        # nvidia-resiliency-ext that satisfies the top-level import used for
+        # HAVE_NVRX but is missing symbols required later by get_async_strategy().
+        strategy = "mcore"
         async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
         async_request.execute_sync()
         del async_request

@@ -11,6 +11,7 @@ import warnings
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
+from megatron.training.global_vars import get_args
 
 logger = logging.getLogger(__name__)
 
@@ -567,7 +568,15 @@ try:
                 if add_BOS:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
-            max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
+            max_tokens = req.get("max_completion_tokens", None)
+            if max_tokens is None:
+                max_tokens = req.get("max_tokens", None)
+            if max_tokens is not None:
+                max_tokens = int(max_tokens)
+                max_context_tokens = getattr(get_args(), "inference_max_seq_length", None)
+                if max_context_tokens is not None:
+                    remaining_context = max(0, max_context_tokens - len(prompt_tokens))
+                    max_tokens = min(max_tokens, remaining_context)
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -575,7 +584,7 @@ try:
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
+                num_tokens_to_generate=max_tokens,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
             )

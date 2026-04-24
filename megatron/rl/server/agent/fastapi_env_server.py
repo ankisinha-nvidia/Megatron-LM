@@ -157,7 +157,9 @@ class FastAPIEnvServer(EnvironmentServer):
             try:
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
-                        f"http://{self.env_server_host_port}/group_rollout/", json=payload, timeout=None
+                        f"http://{self.env_server_host_port}/group_rollout/",
+                        json=payload,
+                        timeout=None,
                     )
                 response.raise_for_status()
                 return [TokenRollout.model_validate(r) for r in response.json()]
