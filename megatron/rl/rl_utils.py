@@ -295,6 +295,8 @@ class RolloutStats:
     rollout_wall_ms: list[list[float]] | None = None
     rollout_started_at_ms: list[list[float]] | None = None
     rollout_finished_at_ms: list[list[float]] | None = None
+    rollout_runtime_run_ms: list[list[float]] | None = None
+    rollout_time_to_first_post_ms: list[list[float]] | None = None
     rollout_inference_ms: list[list[float]] | None = None
     rollout_tool_wall_ms: list[list[float]] | None = None
     rollout_llm_call_count: list[list[float]] | None = None

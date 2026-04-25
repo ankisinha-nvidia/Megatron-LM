@@ -246,7 +246,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 # Make all inference/* metrics use inference_step as their x-axis
                 # This allows inference and training to have independent step counters
-                context.metrics_writer.define_metric(
+                self.metrics_writer.define_metric(
                     "inference/*", step_metric="inference/inference_step"
                 )
                 # Initialize inference step offset by querying existing run history
@@ -309,110 +309,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_cache_hits = 0
         self._prefix_cache_blocks_matched = 0
         self._prefix_coordination_waits = 0
-        self._busy_time_since_log_s = 0.0
-        self._metrics_window_start_s = time.perf_counter()
 
         # Coordinator state.
         self.use_coordinator = False
-
-    def _sample_gpu_utilization_pct(self) -> Optional[float]:
-        """Sample instantaneous GPU utilization percentage, if available."""
-        try:
-            util = torch.cuda.utilization()
-        except Exception:
-            return None
-        try:
-            return float(util)
-        except (TypeError, ValueError):
-            return None
-
-    def _compute_busy_pct(self, *, current_time_s: float) -> float:
-        """Compute rank busy percentage over the elapsed wall-clock logging window."""
-        window_s = max(current_time_s - self._metrics_window_start_s, 1e-9)
-        busy_fraction = self._busy_time_since_log_s / window_s
-        busy_pct = max(0.0, min(100.0, float(busy_fraction * 100.0)))
-        self._busy_time_since_log_s = 0.0
-        self._metrics_window_start_s = current_time_s
-        return busy_pct
-
-    def _build_rank_activity_metrics(
-        self,
-        *,
-        busy_pct: float,
-        gpu_util_pct: Optional[float],
-    ) -> Dict[str, float]:
-        """Build per-rank and aggregated rank activity metrics for W&B logging."""
-        metrics = {
-            f'inference/rank_activity/busy_pct/rank_{self.rank}': float(busy_pct),
-        }
-        if gpu_util_pct is not None:
-            metrics[
-                f'inference/rank_activity/gpu_utilization_pct/rank_{self.rank}'
-            ] = float(gpu_util_pct)
-
-        world_size = (
-            torch.distributed.get_world_size()
-            if torch.distributed.is_initialized()
-            else 1
-        )
-        if world_size == 1:
-            metrics['inference/rank_activity/busy_pct_mean'] = float(busy_pct)
-            metrics['inference/rank_activity/busy_pct_min'] = float(busy_pct)
-            metrics['inference/rank_activity/busy_pct_max'] = float(busy_pct)
-            if gpu_util_pct is not None:
-                metrics['inference/rank_activity/gpu_utilization_pct_mean'] = float(
-                    gpu_util_pct
-                )
-                metrics['inference/rank_activity/gpu_utilization_pct_min'] = float(
-                    gpu_util_pct
-                )
-                metrics['inference/rank_activity/gpu_utilization_pct_max'] = float(
-                    gpu_util_pct
-                )
-            return metrics
-
-        device = torch.device('cuda', torch.cuda.current_device())
-        busy_tensor = torch.tensor([busy_pct], dtype=torch.float32, device=device)
-        busy_sum = busy_tensor.clone()
-        busy_min = busy_tensor.clone()
-        busy_max = busy_tensor.clone()
-        torch.distributed.all_reduce(busy_sum, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(busy_min, op=torch.distributed.ReduceOp.MIN)
-        torch.distributed.all_reduce(busy_max, op=torch.distributed.ReduceOp.MAX)
-        if self.rank == 0:
-            metrics['inference/rank_activity/busy_pct_mean'] = float(
-                busy_sum.item() / world_size
-            )
-            metrics['inference/rank_activity/busy_pct_min'] = float(busy_min.item())
-            metrics['inference/rank_activity/busy_pct_max'] = float(busy_max.item())
-
-        util_valid = gpu_util_pct is not None
-        util_valid_tensor = torch.tensor(
-            [1.0 if util_valid else 0.0], dtype=torch.float32, device=device
-        )
-        torch.distributed.all_reduce(util_valid_tensor, op=torch.distributed.ReduceOp.MIN)
-        if util_valid:
-            util_tensor = torch.tensor([gpu_util_pct], dtype=torch.float32, device=device)
-        else:
-            util_tensor = torch.tensor([0.0], dtype=torch.float32, device=device)
-        util_sum = util_tensor.clone()
-        util_min = util_tensor.clone()
-        util_max = util_tensor.clone()
-        torch.distributed.all_reduce(util_sum, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(util_min, op=torch.distributed.ReduceOp.MIN)
-        torch.distributed.all_reduce(util_max, op=torch.distributed.ReduceOp.MAX)
-        if self.rank == 0 and util_valid_tensor.item() > 0:
-            metrics['inference/rank_activity/gpu_utilization_pct_mean'] = float(
-                util_sum.item() / world_size
-            )
-            metrics['inference/rank_activity/gpu_utilization_pct_min'] = float(
-                util_min.item()
-            )
-            metrics['inference/rank_activity/gpu_utilization_pct_max'] = float(
-                util_max.item()
-            )
-
-        return metrics
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -1908,21 +1807,14 @@ class DynamicInferenceEngine(AbstractEngine):
             self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
-        self._busy_time_since_log_s += float(step_time)
 
-        # Log inference activity and KV cache utilization stats to W&B.
+        # Log KV cache utilization stats to W&B.
         if (
             self.logging_step_interval > 0
             and self.context.step_count > 0
             and self.context.step_count % self.logging_step_interval == 0
             and self.metrics_writer is not None
         ):
-            real_batch_dims = self.context.batch_dimensions
-            graph_batch_dims = self.context.padded_batch_dimensions
-            using_cuda_graph = bool(self.context.using_cuda_graph_this_step())
-            current_time_s = time.perf_counter()
-            busy_pct = self._compute_busy_pct(current_time_s=current_time_s)
-            gpu_util_pct = self._sample_gpu_utilization_pct()
             metrics = {
                 'inference/inference_step': int(
                     self.inference_step_offset + int(self.context.step_count)
@@ -1930,27 +1822,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
-                'inference/gpu_activity/active_request_count': int(real_batch_dims.req_count),
-                'inference/gpu_activity/real_token_count': int(real_batch_dims.token_count),
-                'inference/gpu_activity/real_prefill_request_count': int(real_batch_dims.prefill_req_count),
-                'inference/gpu_activity/real_decode_request_count': int(real_batch_dims.decode_req_count),
-                'inference/gpu_activity/cuda_graph_enabled': int(using_cuda_graph),
-                'inference/gpu_activity/cuda_graph_token_count': int(
-                    graph_batch_dims.token_count if using_cuda_graph else 0
-                ),
-                'inference/gpu_activity/cuda_graph_prefill_request_count': int(
-                    graph_batch_dims.prefill_req_count if using_cuda_graph else 0
-                ),
-                'inference/gpu_activity/cuda_graph_decode_request_count': int(
-                    graph_batch_dims.decode_req_count if using_cuda_graph else 0
-                ),
             }
-            metrics.update(
-                self._build_rank_activity_metrics(
-                    busy_pct=busy_pct,
-                    gpu_util_pct=gpu_util_pct,
-                )
-            )
             if context_state["kv_stats"] is not None:
                 # Add KV stats with inference/ prefix.
                 # Convert utilization metrics from 0-1 range to 0-100 for visualization.
